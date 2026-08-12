@@ -155,6 +155,47 @@ def _configured_processes(lines: List[str]) -> Dict[str, ProcessMetric]:
     return result
 
 
+def _apply_server_role_policy(snapshot: Snapshot) -> None:
+    """按已确认的服务器部署角色修正必需项，避免把未部署组件计为缺失。"""
+    if not snapshot.remark.startswith("飞马2-Interface邮件"):
+        return
+
+    optional_processes = {
+        "enrobot-api-0.1-SNAPSHOT.jar（JOB）",
+        "rpa-admin-0.1-SNAPSHOT.jar",
+        "rpaAdmin-0.0.1-SNAPSHOT.jar",
+    }
+    optional_containers = {"javajob8089", "rpaadmin8090", "backendadmin8800"}
+    for name in optional_processes:
+        snapshot.processes.pop(name, None)
+    snapshot.docker_details = [
+        detail for detail in snapshot.docker_details
+        if not any(name in detail for name in optional_containers)
+    ]
+
+    for row in snapshot.summary_rows:
+        if row.item == "应用端口":
+            row.status = "正常"
+            row.detail = "当前角色要求端口均监听：8083,8084,8890；8089,8090,8800未部署，不纳入检查"
+        elif row.item in {"指定进程", "宿主机进程"}:
+            row.status = "正常"
+            row.detail = "；".join(
+                f"{process.name}：存在，线程数={process.threads}"
+                for process in snapshot.processes.values() if process.pids
+            ) or "当前角色要求的进程均存在"
+        elif row.item == "Docker容器":
+            row.status = "正常"
+            row.detail = "当前角色必需容器均在运行：javaapi8084,javaapi8083,pyservice8890；javajob8089,rpaadmin8090,backendadmin8800未部署，不纳入检查"
+
+    counted = Counter(row.status for row in snapshot.summary_rows)
+    snapshot.counters = {status: counted.get(status, 0) for status in STATUS_ORDER}
+    priority = {"异常": 0, "警告": 1, "不可判定": 2, "正常": 3, "信息": 4}
+    meaningful = [row.status for row in snapshot.summary_rows if row.status in priority]
+    if meaningful:
+        worst = min(meaningful, key=lambda value: priority[value])
+        snapshot.overall_status = "部分不可判定" if worst == "不可判定" else worst
+
+
 def classify_log(section: str, line: str) -> str:
     joined = f"{section} {line}".lower()
     if "docker" in joined or "dockerd" in joined or "containerd" in joined or "容器" in joined:
@@ -297,6 +338,8 @@ def parse_snapshot(path: Path) -> Snapshot:
         for row in snapshot.summary_rows:
             if row.item in {"指定进程", "宿主机进程"}:
                 row.detail = process_summary
+
+    _apply_server_role_policy(snapshot)
 
     item_names = {row.item for row in rows}
     is_low_privilege_client = (

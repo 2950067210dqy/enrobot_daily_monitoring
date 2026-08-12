@@ -10,6 +10,12 @@ PDF 功能已按模块拆分，部署时需要同时复制：
 
 `server_health_interface_mail.sh/.ini` 和 `server_health_client.sh/.ini` 仍负责只读采集 TXT，不会启停服务或修改业务数据。
 
+Interface 两台服务器使用不同配置：飞马1使用 `server_health_interface_mail.ini`；飞马2使用 `server_health_interface_mail_2.ini`。飞马2不部署8089、8090、8800端口及 `javajob8089`、`rpaadmin8090`、`backendadmin8800` 容器，也不要求对应的 JOB、RPA管理端和后台管理端进程，巡检和PDF均不会将它们计为异常。
+
+```bash
+bash server_health_interface_mail.sh -c server_health_interface_mail_2.ini
+```
+
 - `server_health_client.sh` 是普通用户可运行的低权限轻量版，检查主机时间、CPU/负载、内存/Swap、磁盘/inode、磁盘IO及INI中指定的进程。进程明细包含PID、启动时间、CPU、内存和线程数。Docker只判断命令和只读查看能力；服务器没有`docker`命令时显示“不可判定并跳过”，不会尝试安装。它不检查systemd、端口、网络依赖、JVM、日志或业务目录。
 - `server_health_interface_mail.sh` 保留完整服务器检查，并增加磁盘IO概要与明细。异常日志重点读取 `LOG_DIRS` 配置的业务日志目录，只选择最近24小时更新的最新文件；专用 `warn*.log`、`error*.log` 会完整输出，没有专用日志时才从普通日志输出完整异常匹配行，不再截断行数或单行内容。
 
@@ -30,6 +36,8 @@ python -m pip install --force-reinstall -r requirements-server-health-pdf.txt
 - `txt/interface_mail_2/YYYY-MM-DD/`
 
 并生成：`result/YYYY-MM-DD/服务器巡检报告.pdf`。
+
+启动时会自动创建以上三个当天 TXT 目录以及 `result/YYYY-MM-DD/` 结果目录；目录已存在时不会改动其中内容。当天没有 TXT 时，目录仍会创建，然后程序提示没有可汇总文件。
 
 ```bash
 python server_health_pdf_report.py

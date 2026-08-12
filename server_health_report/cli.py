@@ -48,12 +48,10 @@ def default_daily_paths(day_text: str) -> Tuple[List[Path], List[Path]]:
     paths: List[Path] = []
     unavailable: List[Path] = []
     for directory in daily_directories:
-        if directory.is_dir():
-            found = sorted(directory.glob("*.txt"))
-            if found:
-                paths.extend(found)
-            else:
-                unavailable.append(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        found = sorted(directory.glob("*.txt"))
+        if found:
+            paths.extend(found)
         else:
             unavailable.append(directory)
     return resolve_reports([str(path) for path in paths]), unavailable
@@ -85,9 +83,11 @@ def main() -> int:
         output = args.output or (Path.cwd() / "服务器巡检报告.pdf")
     else:
         paths, unavailable = default_daily_paths(day_text)
-        output = args.output or (project_root() / "result" / day_text / "服务器巡检报告.pdf")
+        default_output_directory = project_root() / "result" / day_text
+        default_output_directory.mkdir(parents=True, exist_ok=True)
+        output = args.output or (default_output_directory / "服务器巡检报告.pdf")
         for directory in unavailable:
-            print("提示：默认目录不存在或没有 TXT，已跳过：" + str(directory), file=sys.stderr)
+            print("提示：默认目录没有 TXT，已跳过：" + str(directory), file=sys.stderr)
     missing = [str(path) for path in paths if not path.is_file()]
     if missing or not paths:
         searched = args.reports or [
