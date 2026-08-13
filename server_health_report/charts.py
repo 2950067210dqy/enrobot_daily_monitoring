@@ -18,11 +18,27 @@ def trend_chart(
     height: float = 40 * mm,
     percent: bool = False,
 ) -> Drawing:
+    """绘制服务器资源或线程指标的多时间点趋势图。
+
+    Args:
+        title: 图表标题。
+        labels: 横坐标巡检时间标签。
+        series: 图例名称到数据序列的映射。
+        width: 图表宽度。
+        height: 图表高度。
+        percent_axis: 是否使用百分比纵轴。
+        font_name: 中文字体名称。
+
+    Returns:
+        Drawing: 可插入ReportLab PDF的矢量图表。
+    """
     drawing = Drawing(width, height)
     series_count = max(1, len(series))
     legend_columns = 2 if width >= 120 * mm else 2
     legend_rows = (series_count + legend_columns - 1) // legend_columns
-    left, right, bottom, top = 12 * mm, 4 * mm, (8 + legend_rows * 4) * mm, 9 * mm
+    # 多序列数值统一放在标题下方的顶部留白区；序列较多时自动扩大留白。
+    stacked_label_space = 26 + max(0, series_count - 1) * 8
+    left, right, bottom, top = 12 * mm, 4 * mm, (8 + legend_rows * 4) * mm, max(14 * mm, stacked_label_space)
     plot_w, plot_h = width - left - right, height - bottom - top
     drawing.add(String(2, height - 12, title, fontName="STSong-Light", fontSize=11, fillColor=colors.HexColor("#17365D")))
     values = [float(value) for items in series.values() for value in items if value is not None]
@@ -49,7 +65,15 @@ def trend_chart(
             points.extend([x, y])
             drawing.add(Circle(x, y, 1.5, fillColor=color, strokeColor=None))
             value_text = f"{float(value):.0f}{'%' if percent else ''}"
-            drawing.add(String(x + 2, y + 2, value_text, fontName="STSong-Light", fontSize=7.5, fillColor=color))
+            if series_count > 1:
+                # x 与下方数据点、时间刻度完全一致，只在 y 方向按图例顺序堆叠。
+                label_y = height - 22 - index * 8
+                drawing.add(String(
+                    x, label_y, value_text, fontName="STSong-Light", fontSize=7.2,
+                    textAnchor="middle", fillColor=color,
+                ))
+            else:
+                drawing.add(String(x + 2, y + 2, value_text, fontName="STSong-Light", fontSize=7.5, fillColor=color))
         if len(points) >= 4:
             drawing.add(PolyLine(points, strokeColor=color, strokeWidth=1.2, fillColor=None))
         legend_x = left + (index % legend_columns) * ((width - left - right) / legend_columns)
@@ -57,8 +81,21 @@ def trend_chart(
         drawing.add(Rect(legend_x, legend_y, 2.5 * mm, 1.4 * mm, fillColor=color, strokeColor=None))
         drawing.add(String(legend_x + 3 * mm, legend_y, name, fontName="STSong-Light", fontSize=8, fillColor=colors.HexColor("#455A64")))
     if len(labels) > 1:
-        drawing.add(String(left, 1, labels[0], fontName="STSong-Light", fontSize=7.5, fillColor=colors.HexColor("#78909C")))
-        drawing.add(String(left + plot_w - 23 * mm, 1, labels[-1], fontName="STSong-Light", fontSize=7.5, fillColor=colors.HexColor("#78909C")))
+        if len(labels) <= 6:
+            label_positions = list(range(len(labels)))
+        else:
+            label_positions = sorted({round(index * (len(labels) - 1) / 5.0) for index in range(6)})
+        for position in label_positions:
+            label = labels[position]
+            x = left + (plot_w / max(1, len(labels) - 1)) * position
+            drawing.add(String(
+                x, 1, str(label), fontName="STSong-Light", fontSize=7.2,
+                textAnchor="middle", fillColor=colors.HexColor("#78909C"),
+            ))
     else:
-        drawing.add(String(left + plot_w / 2 - 9 * mm, 1, "单次采样", fontName="STSong-Light", fontSize=8, fillColor=colors.HexColor("#78909C")))
+        single_label = str(labels[0]) if labels else "单次采样"
+        drawing.add(String(
+            left + plot_w / 2, 1, single_label, fontName="STSong-Light", fontSize=8,
+            textAnchor="middle", fillColor=colors.HexColor("#78909C"),
+        ))
     return drawing

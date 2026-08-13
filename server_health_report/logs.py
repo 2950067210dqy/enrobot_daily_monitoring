@@ -11,6 +11,14 @@ SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4, "u
 
 
 def fingerprint(text: str) -> str:
+    """生成异常日志的基础去重指纹。
+
+    Args:
+        text: 原始异常日志文本。
+
+    Returns:
+        str: 移除时间、PID和动态标识后的稳定指纹。
+    """
     value = text.lower()
     value = re.sub(r"\b\d{4}[-/]\d{2}[-/]\d{2}[t ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:z|[+-]\d{2}:?\d{2})?", "<time>", value)
     value = re.sub(r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\b", "<time>", value)
@@ -22,6 +30,14 @@ def fingerprint(text: str) -> str:
 
 
 def group_logs(server: ServerSeries) -> List[LogGroup]:
+    """按服务器归并多个巡检时点中语义稳定的重复日志。
+
+    Args:
+        server: 同一服务器的巡检时间序列。
+
+    Returns:
+        List[LogGroup]: 基础去重后的异常日志组。
+    """
     groups: Dict[str, LogGroup] = {}
     server_name = server.latest.remark
     for snapshot in server.snapshots:
@@ -37,20 +53,26 @@ def group_logs(server: ServerSeries) -> List[LogGroup]:
                     fingerprint=key_text,
                     sample=raw.text,
                     sections=[raw.section],
-                    occurrences=0,
+                    occurrences=1,
                     first_seen=raw.snapshot_time,
                     last_seen=raw.snapshot_time,
                 )
                 groups[group_id] = group
-            group.occurrences += 1
+                continue
             if raw.section not in group.sections:
                 group.sections.append(raw.section)
-            group.first_seen = min(group.first_seen, raw.snapshot_time) if group.first_seen else raw.snapshot_time
-            group.last_seen = max(group.last_seen, raw.snapshot_time) if group.last_seen else raw.snapshot_time
     return list(groups.values())
 
 
 def rule_assessment(group: LogGroup) -> None:
+    """在AI不可用前为日志组生成保守的规则评估。
+
+    Args:
+        group: 待评估的异常日志组。
+
+    Returns:
+        None: 评估字段直接写回日志组。
+    """
     text = group.sample.lower()
     if any(token in text for token in ("oom-killer", "outofmemory", "no space left on device", "panic", "segfault", "data corruption")):
         group.severity, group.immediate, group.needs_fix = "critical", True, True
@@ -62,8 +84,8 @@ def rule_assessment(group: LogGroup) -> None:
         group.severity, group.immediate, group.needs_fix = "medium", False, True
         group.title = "运行错误或连接异常"
     elif "warning" in text or "warn" in text:
-        group.severity, group.immediate, group.needs_fix = "low", False, group.occurrences > 5
-        group.title = "重复警告日志"
+        group.severity, group.immediate, group.needs_fix = "low", False, False
+        group.title = "警告日志"
     else:
         group.severity, group.immediate, group.needs_fix = "info", False, False
         group.title = "一般异常线索"
@@ -72,17 +94,32 @@ def rule_assessment(group: LogGroup) -> None:
 
 
 def assess_with_rules(groups: Iterable[LogGroup]) -> None:
+    """批量应用本地规则，保证每条日志都有可展示的初始结论。
+
+    Args:
+        groups: 待评估日志组集合。
+
+    Returns:
+        None: 评估结果直接写回各日志组。
+    """
     for group in groups:
         rule_assessment(group)
 
 
 def sort_groups(groups: Iterable[LogGroup]) -> List[LogGroup]:
+    """按重要程度和发现时间排列PDF中的异常日志。
+
+    Args:
+        groups: 已评估日志组集合。
+
+    Returns:
+        List[LogGroup]: 严重异常优先的有序日志组。
+    """
     return sorted(
         groups,
         key=lambda item: (
             SEVERITY_ORDER.get(item.severity, 9),
             0 if item.immediate else 1,
-            -item.occurrences,
             item.category,
         ),
     )

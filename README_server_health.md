@@ -10,6 +10,8 @@ PDF 功能已按模块拆分，部署时需要同时复制：
 
 `server_health_interface_mail.sh/.ini` 和 `server_health_client.sh/.ini` 仍负责只读采集 TXT，不会启停服务或修改业务数据。
 
+两份Shell在没有使用 `-o` 指定输出文件时，都会在脚本所在目录创建当天的 `YYYY-MM-DD` 子目录，并把该日每次巡检生成的TXT放入其中。例如：`server-health/2026-08-12/server_health_服务器备注_主机名_20260812_083000.txt`。目录已存在时直接复用，不覆盖或删除已有报告。
+
 Interface 两台服务器使用不同配置：飞马1使用 `server_health_interface_mail.ini`；飞马2使用 `server_health_interface_mail_2.ini`。飞马2不部署8089、8090、8800端口及 `javajob8089`、`rpaadmin8090`、`backendadmin8800` 容器，也不要求对应的 JOB、RPA管理端和后台管理端进程，巡检和PDF均不会将它们计为异常。
 
 ```bash
@@ -17,7 +19,10 @@ bash server_health_interface_mail.sh -c server_health_interface_mail_2.ini
 ```
 
 - `server_health_client.sh` 是普通用户可运行的低权限轻量版，检查主机时间、CPU/负载、内存/Swap、磁盘/inode、磁盘IO及INI中指定的进程。进程明细包含PID、启动时间、CPU、内存和线程数。Docker只判断命令和只读查看能力；服务器没有`docker`命令时显示“不可判定并跳过”，不会尝试安装。它不检查systemd、端口、网络依赖、JVM、日志或业务目录。
-- `server_health_interface_mail.sh` 保留完整服务器检查，并增加磁盘IO概要与明细。异常日志重点读取 `LOG_DIRS` 配置的业务日志目录，只选择最近24小时更新的最新文件；专用 `warn*.log`、`error*.log` 会完整输出，没有专用日志时才从普通日志输出完整异常匹配行，不再截断行数或单行内容。
+- `server_health_interface_mail.sh` 保留完整服务器检查，并增加磁盘IO概要与明细。异常日志重点读取 `LOG_DIRS` 配置的业务日志目录，时间严格限制为脚本执行当天00:00:00至脚本启动时刻；专用 `warn*.log`、`error*.log` 会输出当天完整日志，没有专用日志时才从普通日志输出当天完整异常匹配行，不再截断行数或单行内容。
+- Interface邮件脚本检查监听端口时优先使用 `ss`，服务器没有 `ss` 时自动使用 `netstat`；两者都没有才标记为不可判定。默认路由同样按 `ip`、`route`、`netstat -rn` 顺序降级，不再把命令缺失误报成网络或端口异常。
+- 系统日志（`dmesg`、`journalctl`）只检索 `error/err` 及更严重级别，不检索 `warning/warn`。业务日志优先选择当天的 `warn*.log`、`error*.log`，但文件内容仍须命中 `ERROR、Exception、FATAL、Traceback、OutOfMemory、OOM` 等异常关键字才输出；命中记录后续的完整多行堆栈会一并保留，普通WARN不输出。
+- 为避免历史时间混入日志分析，systemd状态改用不附带日志的 `systemctl show`；各服务的 `journalctl` 强制限制为执行当天且仅取error；Docker详情不再输出历史 `Started/Finished` 和健康检查历史；登录历史 `last` 不再采集。
 
 ## 2. 安装依赖
 
@@ -35,7 +40,7 @@ python -m pip install --force-reinstall -r requirements-server-health-pdf.txt
 - `txt/interface_mail_1/YYYY-MM-DD/`
 - `txt/interface_mail_2/YYYY-MM-DD/`
 
-并生成：`result/YYYY-MM-DD/服务器巡检报告.pdf`。
+并生成：`result/YYYY-MM-DD/服务器巡检报告_YYYY_MM_DD.pdf`。
 
 启动时会自动创建以上三个当天 TXT 目录以及 `result/YYYY-MM-DD/` 结果目录；目录已存在时不会改动其中内容。当天没有 TXT 时，目录仍会创建，然后程序提示没有可汇总文件。
 
@@ -66,7 +71,7 @@ PDF 固定结构：
 
 1. 第一页只有每台服务器的直观图表概要；
 2. 每台服务器的表格文字概要，包含巡检模式、采集覆盖度、检查项、进程线程数/PID、Docker、日志目录与业务目录名称；
-3. CPU、内存、磁盘、磁盘 I/O（iowait/%util）、进程线程数和各日志目录大小的时间变化图；
+3. 图表位于各服务器文字表格之前；CPU、内存、磁盘、磁盘 I/O iowait 和 `%util` 分别成图，横坐标为巡检时间，飞马1、飞马2和Client作为图例系列；另有进程线程数和各日志目录大小的时间变化图；
 4. AI/规则异常数量汇总；
 5. 按系统/进程日志、Docker 日志、应用日志目录日志分类的去重明细，并按重要程度排序。
 
@@ -78,21 +83,25 @@ PDF 固定结构：
 
 ## 4. AI 日志评估
 
-AI 使用 SiliconFlow 的 `deepseek-ai/DeepSeek-V4-Flash`，请求签名沿用 `sign-ts/sign-key` 形式。API Key 不写入源码，使用环境变量：
+AI 使用 DeepSeek 官方接口的 `deepseek-v4-flash`，用于日志语义去重、来源分类、重要程度、处理建议和操作分析。API Key 默认读取 `server_health_report/secret.py` 中的 `api_secret`，也可使用环境变量：
+
+DeepSeek Prompt 保存在 `server_health_report/deepseek_prompt.txt`，程序运行时按 UTF-8 读取。调整分析规则或 JSON 输出约束时直接修改该 TXT，不需要修改 Python 代码。
+
+每台服务器的 CPU、内存、磁盘使用率、IO iowait 和 IO util 时间序列也会交给 DeepSeek，PDF 展示各指标的重要程度、判断依据、建议与操作分析。资源指标并入该服务器第一批日志请求，不额外增加已有日志服务器的请求次数；服务器完全没有异常日志时才单独发送一次指标请求。
 
 AI HTTP 请求使用 Python 标准库，不额外依赖 `requests`。
 
 PowerShell：
 
 ```powershell
-$env:SILICONFLOW_API_KEY="实际密钥"
+$env:DEEPSEEK_API_KEY="实际密钥"
 python server_health_pdf_report.py ./巡检结果 --ai required -o 服务器巡检报告.pdf
 ```
 
 Linux：
 
 ```bash
-export SILICONFLOW_API_KEY='实际密钥'
+export DEEPSEEK_API_KEY='实际密钥'
 python server_health_pdf_report.py ./巡检结果 --ai required -o 服务器巡检报告.pdf
 ```
 
@@ -101,15 +110,32 @@ python server_health_pdf_report.py ./巡检结果 --ai required -o 服务器巡�
 - `--ai auto`：默认；有 Key 时调用 AI，没有 Key 或调用失败时使用规则预分类并在 PDF 中标明；
 - `--ai required`：AI 缺少 Key、请求失败或响应异常时终止，不生成伪造的 AI 结果；
 - `--ai off`：不访问网络，只做规则预分类；
-- `--ai-cache 文件.json`：缓存已经完成的日志组评估，避免相同异常反复计费；
 - `--max-log-groups 300`：PDF 最多显示的去重异常组；`0` 表示全部。
 
-模型只返回重要程度、是否立即处理、是否需要修改、异常标题和判断依据，不生成修复步骤或处置建议。
+模型返回语义重复关系、日志来源分类、重要程度、是否立即处理、是否需要修改、异常标题、判断依据、处理建议和操作分析。
 
 ## 5. 数据边界
 
 - 趋势图只使用 TXT 中真实采集到的数据，不补造缺失采样；
 - 多期数据按 `主机名` 归并；主机名缺失时才使用服务器备注；
-- 日志去重会归一化时间戳、PID、容器 ID、trace/span ID 和普通数字，再按异常模式分组；
-- AI 评估是辅助分类，不等于已确认根因；报告会标明使用的是实时 AI、AI 缓存还是规则预分类；
+- 日志去重会归一化时间戳、PID、容器 ID、trace/span ID 和普通数字，再按异常模式分组；跨小时TXT出现的相同日志只保留第一条，不累计次数；
+- PDF解析层按 `--date` 再做日志日期保险（未传时使用当天）：只有行首日期明确等于目标日期的日志才进入去重和DeepSeek分析；历史日期、无明确日期的状态说明、Docker Started/Finished等元数据均丢弃；
+- AI 按服务器分批，每批最多60个去重日志组、约5.5万字符，目标是每台服务器一次请求；服务器名只发送一次，样例压缩至约800字符，使用紧凑JSON字段；低价值且无需修复的日志不生成冗长建议。JSON先在本地修复，确实失败时直接拆批，不原样重发整批；程序不读取或写入本地AI结果缓存，每次按当前TXT重新分析；
+- AI 评估是辅助分类，不等于已确认根因；报告会标明使用的是实时 AI 还是规则预分类；
 - PDF 不输出原始采集明细全文，不再重复展示前置详细指标和原始异常线索。
+
+程序使用 Loguru 将执行阶段、当前动作、AI批次、JSON解析错误与重试结果写入 `logs/YYYY-MM-DD/server_health_pdf_YYYYMMDD_HHMMSS.log`，同时在控制台显示主要进度。日志不会记录 API Key。
+
+每次 DeepSeek API 返回的完整响应正文、HTTP 状态、请求编号、日志组数量和日志组 ID 单独写入 `logs/YYYY-MM-DD/deepseek_YYYYMMDD_HHMMSS.log`，避免与普通执行进度混在一起；该文件同样不会记录 API Key。
+
+DeepSeek 返回 JSON 使用可读字段名，例如 `log_assessments`、`metric_assessments`、`severity`、`recommendation` 和 `action_analysis`；请求输入仍使用紧凑字段以节省 Token。
+
+Prompt 强制每条日志和每项资源指标都返回非空建议与操作分析；低风险项也必须给出保持现状、持续观察、核验动作或触发升级条件。若模型仍遗漏，PDF 会使用明确的观察和核验兜底文本，不显示“未提供”。
+
+## 6. 知识图谱运维执行履历
+
+每次成功生成 PDF 后，程序会在同一目录生成同名的 `*_运维执行履历.json`。文件包含 `entities`、`relations` 和 `execution_history`，覆盖报告、服务器、巡检快照、TXT证据、资源评估、日志事件、建议与操作分析，可直接作为知识图谱 Agent 的结构化输入。
+
+巡检采集和报告生成会标记为 `completed`；AI 给出的建议和操作分析统一标记为 `proposed_not_executed`，表示待执行方案，不代表服务器已经被修改。
+
+WIKI内容生成要求、提取重点、知识库描述、页面模板和验收规则见 `WIKI_server_health_knowledge_base.md`。

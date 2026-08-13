@@ -8,6 +8,7 @@ from typing import Dict, List, Optional
 
 @dataclass
 class SummaryRow:
+    """保存巡检概要表中的单项检查结论。"""
     status: str
     item: str
     detail: str
@@ -15,6 +16,7 @@ class SummaryRow:
 
 @dataclass
 class ProcessMetric:
+    """保存指定业务进程的名称、线程数和进程实例信息。"""
     name: str
     threads: int = 0
     pids: List[str] = field(default_factory=list)
@@ -23,6 +25,7 @@ class ProcessMetric:
 
 @dataclass
 class LogDirectoryMetric:
+    """保存业务日志目录在单次巡检时的容量与文件数量。"""
     path: str
     size_bytes: float
     file_count: int = 0
@@ -31,6 +34,7 @@ class LogDirectoryMetric:
 
 @dataclass
 class RawLog:
+    """保存从巡检TXT中提取、尚未去重的异常日志证据。"""
     category: str
     section: str
     text: str
@@ -39,6 +43,7 @@ class RawLog:
 
 @dataclass
 class Snapshot:
+    """表示一台服务器在一个采样时间点的完整巡检快照。"""
     path: Path
     remark: str = "未识别"
     hostname: str = "未识别"
@@ -71,11 +76,13 @@ class Snapshot:
 
     @property
     def server_key(self) -> str:
+        """返回跨时间点归并服务器时使用的稳定业务标识。"""
         return self.hostname if self.hostname != "未识别" else self.remark
 
 
 @dataclass
 class LogGroup:
+    """表示基础去重或AI语义去重后的一组同类异常日志。"""
     group_id: str
     server_key: str
     category: str
@@ -90,15 +97,35 @@ class LogGroup:
     needs_fix: Optional[bool] = None
     title: str = "未评估异常"
     reason: str = ""
+    recommendation: str = ""
+    action_analysis: str = ""
+    duplicate_of: Optional[str] = None
+    assessment_source: str = "未评估"
+
+
+@dataclass
+class ResourceAssessment:
+    """保存AI或规则对单项服务器资源趋势的评估结果。"""
+    metric: str
+    severity: str = "unassessed"
+    immediate: Optional[bool] = None
+    needs_fix: Optional[bool] = None
+    title: str = "未评估指标"
+    reason: str = ""
+    recommendation: str = ""
+    action_analysis: str = ""
     assessment_source: str = "未评估"
 
 
 @dataclass
 class ServerSeries:
+    """聚合同一服务器的多次巡检快照、日志和资源评估。"""
     key: str
     snapshots: List[Snapshot]
     log_groups: List[LogGroup] = field(default_factory=list)
+    resource_assessments: List[ResourceAssessment] = field(default_factory=list)
 
     @property
     def latest(self) -> Snapshot:
+        """返回该服务器时间序列中最新的一次巡检快照。"""
         return self.snapshots[-1]

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from collections import Counter
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
@@ -28,6 +28,14 @@ LOG_SIGNAL_RE = re.compile(
 
 
 def read_text(path: Path) -> str:
+    """按常见中英文编码读取服务器巡检TXT。
+
+    Args:
+        path: 巡检TXT路径。
+
+    Returns:
+        str: 解码后的完整文本。
+    """
     payload = path.read_bytes()
     for encoding in ("utf-8-sig", "utf-8", "gb18030", "gbk"):
         try:
@@ -38,10 +46,12 @@ def read_text(path: Path) -> str:
 
 
 def clean(value: str) -> str:
+    """移除会破坏PDF和正则解析的不可见控制字符。"""
     return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", value).strip()
 
 
 def parse_datetime(value: str) -> Optional[datetime]:
+    """从巡检字段或文件名解析采样时间。"""
     value = value.strip()
     try:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -57,6 +67,7 @@ def parse_datetime(value: str) -> Optional[datetime]:
 
 
 def parse_size(value: str) -> float:
+    """将K/M/G/T等目录容量文本统一换算为字节数。"""
     match = re.search(r"([\d.]+)\s*([KMGTPE]?)(?:i?B)?", value, re.IGNORECASE)
     if not match:
         return 0.0
@@ -65,6 +76,7 @@ def parse_size(value: str) -> float:
 
 
 def _percent(detail: str, pattern: str) -> Optional[float]:
+    """根据指定正则从巡检概要中提取百分比数值。"""
     match = re.search(pattern, detail)
     return float(match.group(1)) if match else None
 
@@ -92,6 +104,7 @@ def _process_name_from_command(command: str, fallback: str, pattern: str = "") -
 
 
 def _ps_process_instance(line: str):
+    """解析Shell输出的一行ps进程实例及线程、CPU和内存字段。"""
     fields = line.split()
     # PID PPID USER LSTART(5列) ETIMES CPU MEM NLWP STAT COMM ARGS
     if len(fields) < 14 or not fields[0].isdigit() or not fields[1].isdigit() or not fields[11].isdigit():
@@ -107,6 +120,7 @@ def _configured_processes(lines: List[str]) -> Dict[str, ProcessMetric]:
     current_instances = []
 
     def flush() -> None:
+        """结束当前配置进程段并汇总多个PID的线程数量。"""
         nonlocal current_alias, current_pattern, current_instances
         if current_alias is None:
             return
@@ -155,6 +169,53 @@ def _configured_processes(lines: List[str]) -> Dict[str, ProcessMetric]:
     return result
 
 
+def _apply_probe_compatibility_corrections(snapshot: Snapshot, lines: List[str]) -> None:
+    """用 TXT 原始证据纠正旧版采集概要对缺失命令的误判。"""
+    source_text = "\n".join(lines)
+    ss_unavailable = "ss 命令不可用" in source_text or (
+        "failed to run command 'ss'" in source_text and "No such file or directory" in source_text
+    )
+    ip_unavailable = "ip 命令不可用" in source_text or (
+        "failed to run command 'ip'" in source_text and "No such file or directory" in source_text
+    )
+    listen_lines = [line for line in lines if "LISTEN" in line.upper()]
+
+    for row in snapshot.summary_rows:
+        if row.item == "应用端口" and row.status == "异常" and ss_unavailable:
+            missing_match = re.search(r"未监听=([^；]+)", row.detail)
+            configured_ports = re.findall(r"\d+", missing_match.group(1)) if missing_match else []
+            confirmed_ports = [
+                port for port in configured_ports
+                if any(re.search(rf":{re.escape(port)}(?!\d)", line) for line in listen_lines)
+            ]
+            if configured_ports and len(confirmed_ports) == len(configured_ports):
+                row.status = "正常"
+                row.detail = (
+                    "旧版概要因ss不可用产生误判；netstat原始结果确认全部监听："
+                    + ",".join(confirmed_ports)
+                )
+        elif (
+            row.item == "网络与DNS"
+            and row.status == "异常"
+            and ip_unavailable
+            and "DNS解析正常" in row.detail
+            and ("没有默认路由" in row.detail or "未发现默认路由" in row.detail)
+        ):
+            row.status = "不可判定"
+            row.detail = "ip命令不可用，TXT未采集route/netstat路由表，默认路由不可判定；DNS解析正常"
+
+
+def _recalculate_snapshot_status(snapshot: Snapshot) -> None:
+    """在兼容性和角色修正后重新计算快照总体状态。"""
+    counted = Counter(row.status for row in snapshot.summary_rows)
+    snapshot.counters = {status: counted.get(status, 0) for status in STATUS_ORDER}
+    priority = {"异常": 0, "警告": 1, "不可判定": 2, "正常": 3, "信息": 4}
+    meaningful = [row.status for row in snapshot.summary_rows if row.status in priority]
+    if meaningful:
+        worst = min(meaningful, key=lambda value: priority[value])
+        snapshot.overall_status = "部分不可判定" if worst == "不可判定" else worst
+
+
 def _apply_server_role_policy(snapshot: Snapshot) -> None:
     """按已确认的服务器部署角色修正必需项，避免把未部署组件计为缺失。"""
     if not snapshot.remark.startswith("飞马2-Interface邮件"):
@@ -187,16 +248,11 @@ def _apply_server_role_policy(snapshot: Snapshot) -> None:
             row.status = "正常"
             row.detail = "当前角色必需容器均在运行：javaapi8084,javaapi8083,pyservice8890；javajob8089,rpaadmin8090,backendadmin8800未部署，不纳入检查"
 
-    counted = Counter(row.status for row in snapshot.summary_rows)
-    snapshot.counters = {status: counted.get(status, 0) for status in STATUS_ORDER}
-    priority = {"异常": 0, "警告": 1, "不可判定": 2, "正常": 3, "信息": 4}
-    meaningful = [row.status for row in snapshot.summary_rows if row.status in priority]
-    if meaningful:
-        worst = min(meaningful, key=lambda value: priority[value])
-        snapshot.overall_status = "部分不可判定" if worst == "不可判定" else worst
+    _recalculate_snapshot_status(snapshot)
 
 
 def classify_log(section: str, line: str) -> str:
+    """结合TXT章节和日志内容判断应用、Docker或系统来源。"""
     joined = f"{section} {line}".lower()
     if "docker" in joined or "dockerd" in joined or "containerd" in joined or "容器" in joined:
         return "Docker日志"
@@ -206,14 +262,95 @@ def classify_log(section: str, line: str) -> str:
 
 
 def is_log_line(line: str) -> bool:
+    """过滤说明文字与状态元数据，只保留具有异常信号的日志。"""
     if not line or line.startswith(("$ ", "---", "###", "字段说明：", "以下内容")):
         return False
-    if any(token in line for token in ("扫描最后", "匹配规则=", "ERROR/Exception/Traceback", "失败数=", "候选日志：")):
+    metadata_prefixes = (
+        "本节只统计", "检查时间范围：", "检查策略：", "读取范围：", "实际模式：",
+        "候选文件数：", "候选文件（", "候选日志：", "发现记录：",
+        "以下为完整异常日志内容", "日志内容读取范围：",
+    )
+    if line.startswith(metadata_prefixes):
+        return False
+    if any(token in line for token in ("扫描最后", "匹配规则=", "ERROR/Exception/Traceback", "失败数=")):
+        return False
+    # 这些是Docker/systemd状态元数据，不是日志。历史Started/Finished尤其不能作为当天异常证据。
+    if re.search(r"\b(?:Image|Status|Running|PID|ExitCode|OOMKilled|Health|RestartCount|RestartPolicy|Started|Finished)=", line):
         return False
     return bool(LOG_SIGNAL_RE.search(line))
 
 
-def parse_snapshot(path: Path) -> Snapshot:
+ACTUAL_LOG_START_RE = re.compile(
+    r"^(?:\d{4}[-/]\d{2}[-/]\d{2}[ T]\d{2}:\d{2}:\d{2}|"
+    r"\d{2}:\d{2}:\d{2}(?:[.,]\d+)?\s|"
+    r"(?:ERROR|WARN|WARNING|FATAL|Traceback|Exception)\b)",
+    re.IGNORECASE,
+)
+
+MONTH_NUMBER = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+
+def _log_matches_report_date(line: str, report_date: date) -> bool:
+    """只接受行首能明确匹配报告日期的日志；无日期或历史日期一律拒绝。"""
+    value = line.lstrip()
+    iso = re.match(r"^[\[(]?([12]\d{3})[-/](\d{1,2})[-/](\d{1,2})(?:[ T]|$)", value)
+    if iso:
+        try:
+            return date(int(iso.group(1)), int(iso.group(2)), int(iso.group(3))) == report_date
+        except ValueError:
+            return False
+    chinese = re.match(r"^[\[(]?([12]\d{3})年(\d{1,2})月(\d{1,2})日", value)
+    if chinese:
+        try:
+            return date(int(chinese.group(1)), int(chinese.group(2)), int(chinese.group(3))) == report_date
+        except ValueError:
+            return False
+    syslog = re.match(r"^([A-Za-z]{3})\s+(\d{1,2})\s+\d{2}:\d{2}:\d{2}\b", value)
+    if syslog:
+        month = MONTH_NUMBER.get(syslog.group(1).lower())
+        return month == report_date.month and int(syslog.group(2)) == report_date.day
+    return False
+
+
+def _log_sample_with_continuation(lines: List[str], start: int, limit: int = 1600) -> str:
+    """将多行日志的参数、异常信息和短堆栈拼入同一去重样例。"""
+    first = lines[start]
+    if not ACTUAL_LOG_START_RE.search(first):
+        return first
+    parts = [first]
+    total = len(first)
+    for following in lines[start + 1:start + 31]:
+        if not following:
+            if len(parts) > 1:
+                break
+            continue
+        if SECTION_RE.match(following) or following.startswith(("########", "$ ")):
+            break
+        if ACTUAL_LOG_START_RE.search(following):
+            break
+        if following.startswith(("检查策略：", "读取范围：", "候选文件", "发现记录：")):
+            break
+        addition = "\n" + following
+        if total + len(addition) > limit:
+            break
+        parts.append(following)
+        total += len(addition)
+    return "\n".join(parts)
+
+
+def parse_snapshot(path: Path, report_date: Optional[date] = None) -> Snapshot:
+    """把单份巡检TXT解析为可用于图表和异常分析的快照。
+
+    Args:
+        path: 单个服务器、单个采样时点的巡检TXT。
+        report_date: 日志保险过滤日期；为空时不执行日期过滤。
+
+    Returns:
+        Snapshot: 包含资源、进程、目录、概要和当日日志的巡检快照。
+    """
     source_lines = [clean(raw) for raw in read_text(path).splitlines()]
     basic: Dict[str, str] = {}
     rows: List[SummaryRow] = []
@@ -228,7 +365,7 @@ def parse_snapshot(path: Path) -> Snapshot:
     process_detail_lines: Dict[str, List[str]] = {}
     current_process_name: Optional[str] = None
 
-    for line in source_lines:
+    for line_index, line in enumerate(source_lines):
         if line == "--- 前置详细指标 ---":
             in_front = True
             continue
@@ -262,8 +399,9 @@ def parse_snapshot(path: Path) -> Snapshot:
                 rows.append(SummaryRow(*summary.groups()))
         if in_front and line:
             front_lines.append(line)
-        if in_raw and is_log_line(line):
-            raw_candidates.append((section, line))
+        # PDF解析层再次限制业务日期，避免Shell兼容问题把历史日志送入DeepSeek。
+        if in_raw and is_log_line(line) and (report_date is None or _log_matches_report_date(line, report_date)):
+            raw_candidates.append((section, _log_sample_with_continuation(source_lines, line_index)))
 
     captured_text = basic.get("巡检开始时间") or basic.get("生成时间") or path.stem
     captured_at = parse_datetime(captured_text) or parse_datetime(path.stem) or datetime.fromtimestamp(path.stat().st_mtime)
@@ -339,7 +477,9 @@ def parse_snapshot(path: Path) -> Snapshot:
             if row.item in {"指定进程", "宿主机进程"}:
                 row.detail = process_summary
 
+    _apply_probe_compatibility_corrections(snapshot, source_lines)
     _apply_server_role_policy(snapshot)
+    _recalculate_snapshot_status(snapshot)
 
     item_names = {row.item for row in rows}
     is_low_privilege_client = (
@@ -394,6 +534,14 @@ def parse_snapshot(path: Path) -> Snapshot:
 
 
 def group_servers(snapshots: Iterable[Snapshot]) -> List[ServerSeries]:
+    """按服务器标识归并多个TXT快照并按时间排序。
+
+    Args:
+        snapshots: 从所有输入TXT解析出的巡检快照。
+
+    Returns:
+        List[ServerSeries]: 每台服务器一条连续时间序列。
+    """
     grouped: Dict[str, List[Snapshot]] = {}
     for snapshot in snapshots:
         grouped.setdefault(snapshot.server_key, []).append(snapshot)
