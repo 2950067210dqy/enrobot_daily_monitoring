@@ -6,7 +6,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
-from .models import LogDirectoryMetric, ProcessMetric, RawLog, ServerSeries, Snapshot, SummaryRow
+from .models import DiskMountMetric, LogDirectoryMetric, ProcessMetric, RawLog, ServerSeries, Snapshot, SummaryRow
 
 
 STATUS_ORDER = ("异常", "警告", "不可判定", "正常", "信息")
@@ -25,6 +25,17 @@ LOG_SIGNAL_RE = re.compile(
     r"unhealthy|segfault|panic|I/O error|read-only file system)",
     re.IGNORECASE,
 )
+DISK_CAPACITY_ROW_RE = re.compile(
+    r"^(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+([\d.]+)%\s+(.+)$"
+)
+INODE_ROW_RE = re.compile(r"^(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+([\d.]+)%\s+(.+)$")
+IGNORED_DISK_FS_TYPES = {
+    "autofs", "cgroup", "cgroup2", "configfs", "debugfs", "devtmpfs", "efivarfs",
+    "fusectl", "hugetlbfs", "mqueue", "nsfs", "overlay", "proc", "pstore", "ramfs",
+    "securityfs", "squashfs", "sysfs", "tmpfs", "tracefs",
+}
+# EFI 启动分区容量固定且不承载业务数据，不纳入服务器磁盘健康监测。
+IGNORED_DISK_MOUNT_POINTS = {"/boot/efi"}
 
 
 def read_text(path: Path) -> str:
@@ -79,6 +90,82 @@ def _percent(detail: str, pattern: str) -> Optional[float]:
     """根据指定正则从巡检概要中提取百分比数值。"""
     match = re.search(pattern, detail)
     return float(match.group(1)) if match else None
+
+
+def _disk_mount_metrics(lines: List[str]) -> Dict[str, DiskMountMetric]:
+    """从一个或多个df容量表中提取所有真实磁盘和网络文件系统挂载点。
+
+    Args:
+        lines: 已清理的完整巡检TXT行。
+
+    Returns:
+        Dict[str, DiskMountMetric]: 按挂载点索引的容量使用率；后出现的完整表会补充或覆盖前置单路径表。
+    """
+    result: Dict[str, DiskMountMetric] = {}
+    in_capacity_table = False
+    for line in lines:
+        if line.startswith("Filesystem"):
+            # Client TXT会依次输出单路径容量表、单路径inode表和全部文件系统表，需准确切换表格类型。
+            in_capacity_table = "Type" in line and "Use%" in line and "Mounted" in line
+            continue
+        if not in_capacity_table:
+            continue
+        if not line or line.startswith(("inode：", "Inode：", "---", "$ ")) or line.endswith("："):
+            # 只结束当前表，继续扫描后续的“全部可见文件系统”容量表。
+            in_capacity_table = False
+            continue
+        match = DISK_CAPACITY_ROW_RE.match(line)
+        if not match:
+            continue
+        filesystem, fs_type, size, used, available, percent_text, mount_point = match.groups()
+        if fs_type.lower() in IGNORED_DISK_FS_TYPES:
+            continue
+        mount_point = mount_point.strip()
+        if mount_point in IGNORED_DISK_MOUNT_POINTS:
+            continue
+        result[mount_point] = DiskMountMetric(
+            mount_point=mount_point,
+            percent=float(percent_text),
+            filesystem=filesystem,
+            fs_type=fs_type,
+            size=size,
+            used=used,
+            available=available,
+        )
+    return result
+
+
+def _inode_mount_percentages(lines: List[str]) -> Dict[str, float]:
+    """从一个或多个df inode表中提取每个真实挂载点的inode使用率。
+
+    Args:
+        lines: 已清理的完整巡检TXT行。
+
+    Returns:
+        Dict[str, float]: 挂载点到inode使用率的映射；临时文件系统和overlay由容量结果交叉过滤。
+    """
+    result: Dict[str, float] = {}
+    in_inode_table = False
+    for line in lines:
+        if line.startswith("Filesystem"):
+            # 容量表和inode表可能交替出现；只有IUse%表头才能开启inode解析。
+            in_inode_table = "IUse%" in line and "Mounted" in line
+            continue
+        if not in_inode_table:
+            continue
+        if not line or line.endswith("：") or line.startswith(("Device", "---", "$ ")):
+            # 不在首个单路径表处停止，后续完整inode表仍需继续解析。
+            in_inode_table = False
+            continue
+        match = INODE_ROW_RE.match(line)
+        if not match:
+            continue
+        _, _, _, _, percent_text, mount_point = match.groups()
+        mount_point = mount_point.strip()
+        if mount_point in IGNORED_DISK_MOUNT_POINTS:
+            continue
+        result[mount_point] = float(percent_text)
+    return result
 
 
 def _process_name_from_command(command: str, fallback: str, pattern: str = "") -> str:
@@ -315,14 +402,21 @@ def _log_matches_report_date(line: str, report_date: date) -> bool:
     return False
 
 
-def _log_sample_with_continuation(lines: List[str], start: int, limit: int = 1600) -> str:
-    """将多行日志的参数、异常信息和短堆栈拼入同一去重样例。"""
+def _log_sample_with_continuation(lines: List[str], start: int) -> str:
+    """完整拼接一条日志及其后续参数、异常信息和堆栈内容。
+
+    Args:
+        lines: 当前巡检TXT的全部文本行。
+        start: 异常日志首行在TXT中的下标。
+
+    Returns:
+        str: 从异常首行到下一条日志或下一章节之前的完整日志样例。
+    """
     first = lines[start]
     if not ACTUAL_LOG_START_RE.search(first):
         return first
     parts = [first]
-    total = len(first)
-    for following in lines[start + 1:start + 31]:
+    for following in lines[start + 1:]:
         if not following:
             if len(parts) > 1:
                 break
@@ -333,20 +427,21 @@ def _log_sample_with_continuation(lines: List[str], start: int, limit: int = 160
             break
         if following.startswith(("检查策略：", "读取范围：", "候选文件", "发现记录：")):
             break
-        addition = "\n" + following
-        if total + len(addition) > limit:
-            break
         parts.append(following)
-        total += len(addition)
     return "\n".join(parts)
 
 
-def parse_snapshot(path: Path, report_date: Optional[date] = None) -> Snapshot:
+def parse_snapshot(
+    path: Path,
+    report_date: Optional[date] = None,
+    parse_logs: bool = True,
+) -> Snapshot:
     """把单份巡检TXT解析为可用于图表和异常分析的快照。
 
     Args:
         path: 单个服务器、单个采样时点的巡检TXT。
         report_date: 日志保险过滤日期；为空时不执行日期过滤。
+        parse_logs: 是否提取异常日志；资源趋势历史TXT传False，最新TXT传True。
 
     Returns:
         Snapshot: 包含资源、进程、目录、概要和当日日志的巡检快照。
@@ -400,7 +495,7 @@ def parse_snapshot(path: Path, report_date: Optional[date] = None) -> Snapshot:
         if in_front and line:
             front_lines.append(line)
         # PDF解析层再次限制业务日期，避免Shell兼容问题把历史日志送入DeepSeek。
-        if in_raw and is_log_line(line) and (report_date is None or _log_matches_report_date(line, report_date)):
+        if parse_logs and in_raw and is_log_line(line) and (report_date is None or _log_matches_report_date(line, report_date)):
             raw_candidates.append((section, _log_sample_with_continuation(source_lines, line_index)))
 
     captured_text = basic.get("巡检开始时间") or basic.get("生成时间") or path.stem
@@ -426,14 +521,39 @@ def parse_snapshot(path: Path, report_date: Optional[date] = None) -> Snapshot:
             snapshot.memory_percent = None if available is None else max(0.0, 100.0 - available)
         elif row.item == "磁盘容量":
             snapshot.disk_percent = _percent(row.detail, r"最高使用率=([\d.]+)%")
+            mount_match = re.search(r"挂载点=([^，,]+)", row.detail)
+            if snapshot.disk_percent is not None and mount_match:
+                mount_point = mount_match.group(1).strip()
+                if mount_point not in IGNORED_DISK_MOUNT_POINTS:
+                    snapshot.disk_mounts[mount_point] = DiskMountMetric(
+                        mount_point=mount_point,
+                        percent=snapshot.disk_percent,
+                    )
         elif row.item == "inode":
             snapshot.inode_percent = _percent(row.detail, r"最高使用率=([\d.]+)%")
+            inode_mount_match = re.search(r"挂载点=([^，,]+)", row.detail)
+            if snapshot.inode_percent is not None and inode_mount_match:
+                inode_mount = inode_mount_match.group(1).strip()
+                if inode_mount in snapshot.disk_mounts:
+                    snapshot.disk_mounts[inode_mount].inode_percent = snapshot.inode_percent
         elif row.item == "磁盘IO性能":
             snapshot.io_iowait_percent = _percent(row.detail, r"iowait=([\d.]+)%")
             snapshot.io_util_percent = _percent(row.detail, r"(?:最高)?%util=([\d.]+)%")
             device = re.search(r"最繁忙设备=([^，,]+)", row.detail)
             if device:
                 snapshot.io_device = device.group(1).strip()
+
+    # df明细优先于概要最高值，可同时保留根目录、数据盘和NFS等业务挂载点。
+    detailed_mounts = _disk_mount_metrics(source_lines)
+    if detailed_mounts:
+        snapshot.disk_mounts = detailed_mounts
+        inode_percentages = _inode_mount_percentages(source_lines)
+        for mount_point, mount in snapshot.disk_mounts.items():
+            mount.inode_percent = inode_percentages.get(mount_point)
+        snapshot.disk_percent = max(item.percent for item in detailed_mounts.values())
+        available_inode_values = [item.inode_percent for item in detailed_mounts.values() if item.inode_percent is not None]
+        if available_inode_values:
+            snapshot.inode_percent = max(available_inode_values)
 
     for line in front_lines:
         process = PROCESS_RE.match(line)
@@ -524,7 +644,7 @@ def parse_snapshot(path: Path, report_date: Optional[date] = None) -> Snapshot:
         snapshot.raw_logs.append(RawLog(
             category=classify_log(log_section, text),
             section=log_section,
-            text=text[:1600],
+            text=text,
             snapshot_time=captured_at,
         ))
     if not snapshot.counters:

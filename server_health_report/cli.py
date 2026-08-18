@@ -11,6 +11,7 @@ from typing import List, Optional, Tuple
 from .ai import evaluate_groups
 from .kg_exporter import export_operations_history
 from .logs import assess_with_rules, group_logs
+from .models import ServerSeries
 from .parser import group_servers, parse_snapshot
 from .pdf_renderer import create_pdf
 from .runtime_log import configure_runtime_log, logger
@@ -100,6 +101,39 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def parse_report_series(paths: List[Path], report_date: date) -> List[ServerSeries]:
+    """解析全部资源快照，但每台服务器只从最后一次TXT提取日志。
+
+    监控Shell输出从当天零点累计到当前执行时间，最后一次巡检已经包含此前日志。
+    因此历史TXT仅用于CPU、内存、磁盘、IO、进程和目录趋势，避免累计日志重复进入去重和AI。
+
+    Args:
+        paths: 本次报告输入的全部巡检TXT路径。
+        report_date: 允许进入报告和DeepSeek分析的目标日志日期。
+
+    Returns:
+        List[ServerSeries]: 按服务器归并的时间序列，且只有最新快照包含日志。
+    """
+    snapshots = [
+        parse_snapshot(path, report_date=report_date, parse_logs=False)
+        for path in paths
+    ]
+    servers = group_servers(snapshots)
+    for server in servers:
+        latest_path = server.latest.path
+        latest_snapshot = parse_snapshot(latest_path, report_date=report_date, parse_logs=True)
+        # 用重新解析的最新快照替换原对象，使后续去重只看到最后一次累计日志。
+        server.snapshots[-1] = latest_snapshot
+        logger.info(
+            "服务器={}仅从最新TXT提取日志：时间={}，文件={}，日志条数={}",
+            latest_snapshot.remark,
+            latest_snapshot.captured_text,
+            latest_path.name,
+            len(latest_snapshot.raw_logs),
+        )
+    return servers
+
+
 def main() -> int:
     """编排TXT解析、日志评估、PDF及知识图谱履历生成流程。
 
@@ -143,8 +177,8 @@ def main() -> int:
         print("--max-log-groups 不能小于 0。", file=sys.stderr)
         return 2
     report_date = date.fromisoformat(day_text)
-    logger.info("开始解析 {} 份TXT；日志日期保险={}", len(paths), report_date.isoformat())
-    servers = group_servers([parse_snapshot(path, report_date=report_date) for path in paths])
+    logger.info("开始解析 {} 份TXT；每台服务器仅解析最新TXT日志；日志日期保险={}", len(paths), report_date.isoformat())
+    servers = parse_report_series(paths, report_date)
     logger.info("TXT解析完成：识别 {} 台服务器", len(servers))
     groups = []
     for server in servers:
@@ -166,12 +200,14 @@ def main() -> int:
         server.log_groups = [group for group in groups if group.server_key == server.latest.remark]
     logger.info("开始生成PDF：{}", output.resolve())
     try:
-        create_pdf(servers, output, ai_status, args.max_log_groups)
+        chart_paths = create_pdf(servers, output, ai_status, args.max_log_groups)
     except PermissionError as exc:
         occupied_output = output
         output = next_available_output(occupied_output)
         logger.warning("目标PDF无写入权限或正被占用：{}；改为创建新PDF：{}；错误={}", occupied_output.resolve(), output.resolve(), exc)
-        create_pdf(servers, output, ai_status, args.max_log_groups)
+        chart_paths = create_pdf(servers, output, ai_status, args.max_log_groups)
+    chart_directory = chart_paths[0].parent.resolve() if chart_paths else output.parent.resolve()
+    logger.info("图表PNG生成完成：目录={}，图片数量={}", chart_directory, len(chart_paths))
     logger.info("PDF生成完成：文件={}，TXT={}，服务器={}，唯一日志组={}", output.resolve(), len(paths), len(servers), len(groups))
     history_output = output.with_name(f"{output.stem}_运维执行履历.json")
     logger.info("开始生成知识图谱运维执行履历：{}", history_output.resolve())
@@ -184,6 +220,7 @@ def main() -> int:
         export_operations_history(servers, paths, output, history_output, day_text, ai_status)
     logger.info("知识图谱运维执行履历生成完成：{}", history_output.resolve())
     print(f"已汇总 {len(paths)} 份 TXT、{len(servers)} 台服务器、{len(groups)} 条唯一异常日志：{output.resolve()}")
+    print(f"图表图片目录：{chart_directory}（{len(chart_paths)} 张PNG）")
     print("知识图谱运维执行履历：" + str(history_output.resolve()))
     print("日志评估状态：" + ai_status)
     print("执行日志：" + str(log_path.resolve()))

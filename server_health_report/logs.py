@@ -61,6 +61,10 @@ def group_logs(server: ServerSeries) -> List[LogGroup]:
                 continue
             if raw.section not in group.sections:
                 group.sections.append(raw.section)
+            # 首次出现已在创建日志组时计为1；后续相同指纹只累加次数，不再生成重复明细行。
+            group.occurrences += 1
+            if group.last_seen is None or raw.snapshot_time > group.last_seen:
+                group.last_seen = raw.snapshot_time
     return list(groups.values())
 
 

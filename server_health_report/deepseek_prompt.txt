@@ -2,15 +2,22 @@
 
 任务：
 1. 对日志合并语义相同项、分类、定级，并给出判断、建议和操作分析。
-2. 若输入含metrics，分别评估cpu、memory、disk、iowait、util的趋势、峰值和最新值，并给出判断、建议和操作分析。
+2. 若输入含metrics，分别评估cpu、memory、disk、iowait、util的趋势、峰值和最新值，并给出判断、建议和操作分析。disk序列的第三项可能是“挂载点到使用率”的映射；必须逐个挂载点判断，reason中明确指出达到最高值或需要关注的挂载点。
 
 定级规则：critical仅用于服务中断、OOM、磁盘写满、崩溃循环、数据损坏或安全事故；high为高概率影响服务；medium为需要处理但没有即时中断；low为低影响；info为线索。不得仅按出现次数定级。
 
 输出约束：
 - 语义相同的日志用duplicate_of指向本批主项。
-- title不超过16字，reason不超过50字，recommendation不超过60字，action_analysis不超过100字。
+- title不超过16字，reason不超过50字，recommendation不超过60字，action_analysis不超过400字。
 - 每条日志和每项资源指标的recommendation、action_analysis必须是有实际含义的非空字符串，不得返回空字符串、null、“未提供”或“无”。
-- 即使风险低或无需修复，recommendation也要说明保持现状、持续观察或关注条件；action_analysis至少给出一个核验动作、观察项或触发升级条件。
+- 每条action_analysis必须包含与该异常或资源指标直接相关、可在Linux服务器执行的命令步骤，使用“1) 命令；2) 命令；3) 命令”的单行格式。先给只读检查和定位命令，再给验证命令；不得只写自然语言。
+- 即使风险低或无需修复，recommendation也要说明保持现状、持续观察或关注条件；action_analysis仍须给出至少一个只读核验命令，例如查看资源、进程、端口、容器或相关日志的命令。
+- 命令必须与输入证据匹配，不得假设服务器一定安装ss、ip、journalctl、docker等工具；必要时先用command -v检查，并提供netstat、route、ps、grep等可用回退方式。
+- Linux命令涉及目录或文件时，不得输出或复制任何具体绝对路径、用户目录、部署目录或精确日志文件路径；即使输入证据中包含具体路径，也不得在recommendation或action_analysis中复述。
+- 目录和文件必须改用业务语义名称或明确占位符，例如“在API日志目录下执行 grep -n 'ERROR' *.log”“检查API日志目录下的log文件”“cd <API日志目录> && grep -n 'ERROR' *.log”或“cp <配置目录>/<配置文件> <配置备份目录>/”。不得写成直接操作任何以斜杠开头的具体目录或文件。
+- 不知道目录所属业务时统一写成“相关应用日志目录”“相关配置目录”“相关数据目录”，不得猜测真实路径。占位符表示执行人员根据实际配置确认后替换，不代表可以直接复制执行。
+- 不得直接给出rm -rf、格式化磁盘、清空日志、强制终止关键进程等破坏性命令。涉及重启服务、删除文件、修改配置或释放磁盘空间时，必须写成“核验后经人工确认再执行”的条件步骤，并同时给出备份或回滚检查命令。
+- Linux命令不要使用Markdown代码块，不要换行；命令中的双引号必须按JSON规则转义，能使用单引号时优先使用单引号，以减少无效JSON。
 - category只能是application、docker、system_process；severity只能是critical、high、medium、low、info；资源metric必须沿用cpu、memory、disk、iowait、util。
 - 只返回严格JSON，不得返回Markdown，不得遗漏任何输入id。属性名必须完整，不得使用单字母缩写。
 

@@ -33,6 +33,19 @@ class LogDirectoryMetric:
 
 
 @dataclass
+class DiskMountMetric:
+    """保存单个持久化磁盘或网络文件系统挂载点的容量使用情况。"""
+    mount_point: str
+    percent: float
+    filesystem: str = "未采集"
+    fs_type: str = "未采集"
+    size: str = "未采集"
+    used: str = "未采集"
+    available: str = "未采集"
+    inode_percent: Optional[float] = None
+
+
+@dataclass
 class RawLog:
     """保存从巡检TXT中提取、尚未去重的异常日志证据。"""
     category: str
@@ -57,6 +70,7 @@ class Snapshot:
     cpu_percent: Optional[float] = None
     memory_percent: Optional[float] = None
     disk_percent: Optional[float] = None
+    disk_mounts: Dict[str, DiskMountMetric] = field(default_factory=dict)
     inode_percent: Optional[float] = None
     io_iowait_percent: Optional[float] = None
     io_util_percent: Optional[float] = None

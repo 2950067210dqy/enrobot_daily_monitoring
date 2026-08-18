@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
+import sqlite3
 import urllib.error
 import urllib.request
+from contextlib import closing
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional
 
@@ -17,6 +21,7 @@ AI_MODEL = "deepseek-v4-flash"
 VALID_CATEGORIES = {"应用日志目录日志", "Docker日志", "系统/进程日志"}
 CATEGORY_TO_CODE = {"应用日志目录日志": "a", "Docker日志": "d", "系统/进程日志": "s"}
 CODE_TO_CATEGORY = {value: key for key, value in CATEGORY_TO_CODE.items()}
+AI_CACHE_SCHEMA_VERSION = 1
 
 
 def build_prompt() -> str:
@@ -81,10 +86,16 @@ def _metric_payload(server: Optional[ServerSeries]) -> dict:
         for snapshot in server.snapshots:
             value = getattr(snapshot, attribute)
             if value is not None:
-                values.append([
-                    snapshot.captured_at.strftime("%m-%d %H:%M") if snapshot.captured_at else snapshot.captured_text,
-                    round(float(value), 2),
-                ])
+                time_text = snapshot.captured_at.strftime("%m-%d %H:%M") if snapshot.captured_at else snapshot.captured_text
+                if metric == "disk" and snapshot.disk_mounts:
+                    # 保留最高值兼容既有Prompt，同时把各挂载点真实使用率交给AI定位具体磁盘。
+                    values.append([
+                        time_text,
+                        round(float(value), 2),
+                        {mount: round(item.percent, 2) for mount, item in snapshot.disk_mounts.items()},
+                    ])
+                else:
+                    values.append([time_text, round(float(value), 2)])
         result[metric] = values
     return result
 
@@ -97,6 +108,178 @@ def _request_payload(groups: List[LogGroup], server: Optional[ServerSeries]) -> 
     if metrics:
         payload["metrics"] = metrics
     return payload
+
+
+def _cache_database_path() -> Path:
+    """返回本地DeepSeek评估缓存数据库路径。
+
+    可通过SERVER_HEALTH_AI_CACHE_PATH覆盖默认位置，便于部署时把缓存放到持久化磁盘。
+
+    Returns:
+        Path: 默认位于项目cache目录下的SQLite数据库路径。
+    """
+    configured = os.environ.get("SERVER_HEALTH_AI_CACHE_PATH", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return Path(__file__).resolve().parent.parent / "cache" / "deepseek_ai_cache.sqlite3"
+
+
+def _cache_key(groups: List[LogGroup], server: Optional[ServerSeries]) -> str:
+    """根据模型、Prompt和当前批次真实输入计算稳定缓存键。
+
+    Args:
+        groups: 当前请求中的基础去重日志组。
+        server: 首批请求携带的服务器资源时间序列。
+
+    Returns:
+        str: SHA-256缓存键；任一分析输入变化都会产生新键。
+    """
+    identity = {
+        "schema_version": AI_CACHE_SCHEMA_VERSION,
+        "model": AI_MODEL,
+        "temperature": 0.1,
+        "max_tokens": 4096,
+        "prompt": build_prompt(),
+        "input": _request_payload(groups, server),
+    }
+    canonical = json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _initialize_cache(connection: sqlite3.Connection) -> None:
+    """创建DeepSeek缓存表和查询索引。
+
+    Args:
+        connection: 已打开的SQLite连接。
+    """
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS deepseek_assessment_cache (
+            cache_key TEXT PRIMARY KEY,
+            model TEXT NOT NULL,
+            response_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            last_hit_at TEXT NOT NULL,
+            hit_count INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_deepseek_cache_model ON deepseek_assessment_cache(model)"
+    )
+
+
+def _cache_response_is_complete(
+    parsed: dict, groups: List[LogGroup], server: Optional[ServerSeries],
+) -> bool:
+    """判断AI响应是否完整到足以安全复用于后续相同请求。
+
+    Args:
+        parsed: 已规范化的DeepSeek结构化响应。
+        groups: 本批要求评估的日志组。
+        server: 本批要求评估的服务器资源指标。
+
+    Returns:
+        bool: 日志和实际采集到的资源指标均有对应结果时返回True。
+    """
+    assessments = parsed.get("assessments", [])
+    returned_group_ids = {str(item.get("id")) for item in assessments if isinstance(item, dict)}
+    if any(group.group_id not in returned_group_ids for group in groups):
+        return False
+    if server is None:
+        return True
+    expected_metrics = {
+        metric for metric, values in _metric_payload(server).items() if values
+    }
+    returned_metrics = {
+        str(item.get("metric", item.get("id")) or "")
+        for item in parsed.get("metric_assessments", []) if isinstance(item, dict)
+    }
+    return expected_metrics.issubset(returned_metrics)
+
+
+def _load_cached_response(
+    groups: List[LogGroup], server: Optional[ServerSeries],
+) -> Optional[dict]:
+    """读取并校验一个完全匹配当前AI请求的本地缓存结果。
+
+    Args:
+        groups: 当前批次日志组。
+        server: 当前批次资源指标服务器。
+
+    Returns:
+        Optional[dict]: 命中且完整时返回结构化结果，否则返回None并继续请求AI。
+    """
+    database_path = _cache_database_path()
+    cache_key = _cache_key(groups, server)
+    try:
+        database_path.parent.mkdir(parents=True, exist_ok=True)
+        with closing(sqlite3.connect(str(database_path), timeout=10)) as connection:
+            _initialize_cache(connection)
+            row = connection.execute(
+                "SELECT response_json FROM deepseek_assessment_cache WHERE cache_key = ? AND model = ?",
+                (cache_key, AI_MODEL),
+            ).fetchone()
+            if row is None:
+                return None
+            parsed = json.loads(row[0])
+            if not isinstance(parsed, dict) or not _cache_response_is_complete(parsed, groups, server):
+                connection.execute(
+                    "DELETE FROM deepseek_assessment_cache WHERE cache_key = ?", (cache_key,)
+                )
+                logger.warning("DeepSeek本地缓存不完整，已丢弃并重新请求：键={}", cache_key[:12])
+                return None
+            now = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+            connection.execute(
+                "UPDATE deepseek_assessment_cache SET last_hit_at = ?, hit_count = hit_count + 1 WHERE cache_key = ?",
+                (now, cache_key),
+            )
+            connection.commit()
+            return parsed
+    except (OSError, sqlite3.Error, json.JSONDecodeError, TypeError, ValueError) as exc:
+        # 缓存故障不能阻断报告生成；退化为正常DeepSeek请求。
+        logger.warning("读取DeepSeek本地缓存失败，将直接请求AI：{}", exc)
+        return None
+
+
+def _store_cached_response(
+    groups: List[LogGroup], server: Optional[ServerSeries], parsed: dict,
+) -> bool:
+    """把完整有效的DeepSeek评估写入本地SQLite缓存。
+
+    Args:
+        groups: 当前批次日志组。
+        server: 当前批次资源指标服务器。
+        parsed: DeepSeek返回并已规范化的结构化结果。
+
+    Returns:
+        bool: 成功写入或更新缓存时返回True；不完整或写入失败时返回False。
+    """
+    if not _cache_response_is_complete(parsed, groups, server):
+        logger.warning("DeepSeek响应不完整，本批结果不写入本地缓存")
+        return False
+    database_path = _cache_database_path()
+    cache_key = _cache_key(groups, server)
+    now = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    try:
+        database_path.parent.mkdir(parents=True, exist_ok=True)
+        response_json = json.dumps(parsed, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        with closing(sqlite3.connect(str(database_path), timeout=10)) as connection:
+            _initialize_cache(connection)
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO deepseek_assessment_cache
+                    (cache_key, model, response_json, created_at, last_hit_at, hit_count)
+                VALUES (?, ?, ?, ?, ?, 0)
+                """,
+                (cache_key, AI_MODEL, response_json, now, now),
+            )
+            connection.commit()
+        logger.info("DeepSeek结果已写入本地缓存：键={}，数据库={}", cache_key[:12], database_path)
+        return True
+    except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+        logger.warning("写入DeepSeek本地缓存失败，本次AI结果仍正常用于PDF：{}", exc)
+        return False
 
 
 def _batches(groups: List[LogGroup], max_items: int, max_chars: int) -> Iterator[List[LogGroup]]:
@@ -285,7 +468,6 @@ def _apply_resource(server: ServerSeries, assessments: List[dict]) -> None:
 
 def _merge_ai_duplicates(groups: List[LogGroup]) -> None:
     """根据AI的duplicate_of关系移除语义重复从项。"""
-    """按 AI 返回的主记录合并同服务器语义重复项，并保留时间范围和章节来源。"""
     by_id = {group.group_id: group for group in groups}
     removed = set()
     for group in groups:
@@ -301,6 +483,8 @@ def _merge_ai_duplicates(groups: List[LogGroup]) -> None:
             target.first_seen = group.first_seen
         if group.last_seen and (target.last_seen is None or group.last_seen > target.last_seen):
             target.last_seen = group.last_seen
+        # AI语义去重可能合并不同基础指纹，出现次数也要归入主事件供PDF展示重复数量。
+        target.occurrences += group.occurrences
         removed.add(group.group_id)
     groups[:] = [group for group in groups if group.group_id not in removed]
 
@@ -319,7 +503,7 @@ def evaluate_groups(
     servers: Optional[List[ServerSeries]] = None,
     mode: str = "auto",
     api_key: Optional[str] = None,
-    batch_size: int = 60,
+    batch_size: int = 15,
     max_batch_chars: int = 55000,
 ) -> str:
     """按服务器集中完成日志语义去重和资源指标AI评估。
@@ -328,8 +512,9 @@ def evaluate_groups(
         groups: 全部服务器的基础去重日志组。
         servers: 服务器时间序列，用于携带资源指标。
         mode: auto自动降级、required失败终止、off关闭AI。
-        max_items: 单次请求最大日志组数量。
-        max_chars: 单次请求最大输入字符预算。
+        api_key: 可选的显式DeepSeek API密钥，主要供受控调用或测试使用。
+        batch_size: 单次请求最大日志组数量，默认15组以降低长JSON损坏概率。
+        max_batch_chars: 单次请求最大输入字符预算。
 
     Returns:
         str: 供PDF和履历展示的AI执行状态说明。
@@ -338,14 +523,16 @@ def evaluate_groups(
         logger.info("AI模式=off，跳过DeepSeek，保留规则预分类")
         return "AI 已关闭"
     key = api_key or _secret_api_key() or os.environ.get("DEEPSEEK_API_KEY", "").strip()
-    if not key:
-        if mode == "required":
-            raise RuntimeError("secret.py 未配置 api_secret，且未设置 DEEPSEEK_API_KEY。")
-        return "未配置 DeepSeek API 密钥，使用规则预分类"
     pending = list(groups)
-    logger.info("AI准备完成：日志组总数={}，不使用本地缓存，全部重新分析", len(groups))
+    logger.info(
+        "AI准备完成：日志组总数={}，单批上限={}组，字符上限={}，API密钥={}，本地缓存={}",
+        len(groups), max(1, batch_size), max(6000, max_batch_chars),
+        "已配置" if key else "未配置（仅使用命中缓存）", _cache_database_path(),
+    )
 
     request_count = 0
+    cache_hit_count = 0
+    cache_miss_without_key = 0
     # 按服务器分别分批：服务器名每批只发送一次，也确保AI语义去重不会跨服务器。
     pending_by_server: Dict[str, List[LogGroup]] = {}
     for group in pending:
@@ -361,30 +548,47 @@ def evaluate_groups(
             initial_batches.append((batch, server_by_name.get(server_name) if index == 0 else None, server_name))
 
     def process_batch(batch: List[LogGroup], metric_server: Optional[ServerSeries], server_name: str) -> None:
-        """执行单个AI批次，并在长JSON损坏时递归拆批重试。"""
-        nonlocal request_count
-        request_count += 1
-        try:
-            parsed = _request_batch(batch, key, request_count, metric_server)
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-            # 本地自动修复仍无法解析时直接拆分，不再原样重发整批，减少无效请求。
-            if len(batch) <= 1:
-                if not batch:
-                    logger.error("服务器 {} 的纯资源指标请求返回无效JSON，跳过资源AI评估", server_name)
-                    return
-                group = batch[0]
-                group.assessment_source = "规则预分类（AI返回无效JSON）"
-                logger.error("单条日志组 {} 返回无效JSON，跳过AI并保留规则预分类", group.group_id)
+        """优先复用本地缓存，否则执行AI批次并在JSON损坏时递归拆批。"""
+        nonlocal request_count, cache_hit_count, cache_miss_without_key
+        parsed = _load_cached_response(batch, metric_server)
+        if parsed is not None:
+            cache_hit_count += 1
+            logger.info(
+                "DeepSeek本地缓存命中：服务器={}，日志组={}，携带资源指标={}，跳过API请求",
+                server_name, len(batch), metric_server is not None,
+            )
+        else:
+            if not key:
+                cache_miss_without_key += 1
+                message = "本批未命中缓存，且未配置DeepSeek API密钥"
+                if mode == "required":
+                    raise RuntimeError(message + "；required模式无法继续。")
+                logger.warning("{}：服务器={}，日志组={}，保留规则预分类", message, server_name, len(batch))
                 return
-            middle = len(batch) // 2
-            logger.warning("批次返回无效JSON，直接拆分为 {} 和 {} 条，避免原批次重复计费", middle, len(batch) - middle)
-            process_batch(batch[:middle], metric_server, server_name)
-            process_batch(batch[middle:], None, server_name)
-            return
+            request_count += 1
+            try:
+                parsed = _request_batch(batch, key, request_count, metric_server)
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                # 本地自动修复仍无法解析时直接拆分，不再原样重发整批，减少无效请求。
+                if len(batch) <= 1:
+                    if not batch:
+                        logger.error("服务器 {} 的纯资源指标请求返回无效JSON，跳过资源AI评估", server_name)
+                        return
+                    group = batch[0]
+                    group.assessment_source = "规则预分类（AI返回无效JSON）"
+                    logger.error("单条日志组 {} 返回无效JSON，跳过AI并保留规则预分类", group.group_id)
+                    return
+                middle = len(batch) // 2
+                logger.warning("批次返回无效JSON，直接拆分为 {} 和 {} 条，避免原批次重复计费", middle, len(batch) - middle)
+                process_batch(batch[:middle], metric_server, server_name)
+                process_batch(batch[middle:], None, server_name)
+                return
+            _store_cached_response(batch, metric_server, parsed)
         by_id = {str(item.get("id")): item for item in parsed.get("assessments", [])}
         for group in batch:
             assessment = by_id.get(group.group_id)
             if assessment:
+                # 无论实时请求还是缓存复用，结果都来自DeepSeek，PDF来源列保持原AI标记。
                 _apply(group, assessment, "AI实时评估")
         missing_count = len(batch) - len([group for group in batch if group.group_id in by_id])
         if missing_count:
@@ -397,5 +601,16 @@ def evaluate_groups(
         logger.info("处理AI初始批次 {}/{}", index, len(initial_batches))
         process_batch(batch, metric_server, server_name)
     _merge_ai_duplicates(groups)
-    logger.info("AI处理完成：语义去重后剩余 {} 个日志组", len(groups))
-    return f"DeepSeek V4-Flash 语义去重、分类及分析完成（{request_count} 次请求）"
+    logger.info(
+        "AI处理完成：语义去重后剩余 {} 个日志组，实际API请求={}，本地缓存命中批次={}，无密钥未命中批次={}",
+        len(groups), request_count, cache_hit_count, cache_miss_without_key,
+    )
+    if cache_miss_without_key:
+        return (
+            "部分复用DeepSeek V4-Flash本地评估，未命中项使用规则预分类"
+            f"（{cache_hit_count} 批缓存命中，{cache_miss_without_key} 批未命中）"
+        )
+    return (
+        "DeepSeek V4-Flash 语义去重、分类及分析完成"
+        f"（{request_count} 次请求，{cache_hit_count} 批本地缓存命中）"
+    )

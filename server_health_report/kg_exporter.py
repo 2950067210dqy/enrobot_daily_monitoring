@@ -94,6 +94,19 @@ def _snapshot_properties(snapshot: Snapshot) -> dict:
             "cpu_percent": snapshot.cpu_percent,
             "memory_percent": snapshot.memory_percent,
             "disk_percent": snapshot.disk_percent,
+            "disk_mounts": [
+                {
+                    "mount_point": item.mount_point,
+                    "percent": item.percent,
+                    "filesystem": item.filesystem,
+                    "fs_type": item.fs_type,
+                    "size": item.size,
+                    "used": item.used,
+                    "available": item.available,
+                    "inode_percent": item.inode_percent,
+                }
+                for item in sorted(snapshot.disk_mounts.values(), key=lambda mount: mount.mount_point)
+            ],
             "inode_percent": snapshot.inode_percent,
             "io_iowait_percent": snapshot.io_iowait_percent,
             "io_util_percent": snapshot.io_util_percent,
