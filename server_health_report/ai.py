@@ -24,6 +24,20 @@ CODE_TO_CATEGORY = {value: key for key, value in CATEGORY_TO_CODE.items()}
 AI_CACHE_SCHEMA_VERSION = 1
 
 
+class InvalidDeepSeekKeyError(RuntimeError):
+    """表示DeepSeek明确拒绝当前API Key，需要立即停止后续网络请求。"""
+
+
+def _is_invalid_key_response(status: int, body: str) -> bool:
+    """根据HTTP状态和响应正文识别无效或无权限的DeepSeek API Key。"""
+    if status in {401, 403}:
+        return True
+    normalized = body.lower()
+    return status == 400 and any(token in normalized for token in (
+        "invalid api key", "invalid_api_key", "authentication", "unauthorized",
+    ))
+
+
 def build_prompt() -> str:
     """读取外置的DeepSeek运维分析提示词。
 
@@ -66,21 +80,18 @@ def _payload(groups: Iterable[LogGroup]) -> List[dict]:
 
 
 def _metric_payload(server: Optional[ServerSeries]) -> dict:
-    """提取一台服务器的资源指标时间序列。
+    """提取一台服务器的磁盘指标时间序列。
 
     Args:
         server: 待分析服务器；为空时不发送资源指标。
 
     Returns:
-        dict: CPU、内存、磁盘和IO的时间点数值。
+        dict: 磁盘最高使用率及各挂载点使用率的时间序列。
     """
     if server is None:
         return {}
     result = {}
-    attributes = {
-        "cpu": "cpu_percent", "memory": "memory_percent", "disk": "disk_percent",
-        "iowait": "io_iowait_percent", "util": "io_util_percent",
-    }
+    attributes = {"disk": "disk_percent"}
     for metric, attribute in attributes.items():
         values = []
         for snapshot in server.snapshots:
@@ -96,7 +107,8 @@ def _metric_payload(server: Optional[ServerSeries]) -> dict:
                     ])
                 else:
                     values.append([time_text, round(float(value), 2)])
-        result[metric] = values
+        if values:
+            result[metric] = values
     return result
 
 
@@ -390,6 +402,8 @@ def _request_batch(
             request_number, status, len(batch), server is not None, ",".join(group.group_id for group in batch), body,
         )
         if status != 200:
+            if _is_invalid_key_response(status, body):
+                raise InvalidDeepSeekKeyError(f"DeepSeek API Key无效或无权限（HTTP {status}）")
             raise RuntimeError(f"DeepSeek HTTP {status}: {body[:500]}")
         outer = json.loads(body)
         model_content = outer["choices"][0]["message"]["content"]
@@ -412,6 +426,10 @@ def _request_batch(
             request_number, exc.code, len(batch), server is not None, ",".join(group.group_id for group in batch), body,
         )
         logger.error("DeepSeek请求 #{}：HTTP {}，响应摘要={}", request_number, exc.code, body[:500])
+        if _is_invalid_key_response(exc.code, body):
+            raise InvalidDeepSeekKeyError(
+                f"DeepSeek API Key无效或无权限（HTTP {exc.code}）"
+            ) from exc
         raise RuntimeError(f"DeepSeek HTTP {exc.code}: {body[:500]}") from exc
     except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
         logger.warning("DeepSeek请求 #{}：JSON解析失败：{}", request_number, exc)
@@ -442,8 +460,8 @@ def _apply(group: LogGroup, assessment: dict, source: str) -> None:
 
 
 def _apply_resource(server: ServerSeries, assessments: List[dict]) -> None:
-    """将AI资源评估写回服务器并为缺失结果生成规则兜底。"""
-    metric_names = {"cpu": "CPU", "memory": "内存", "disk": "磁盘", "iowait": "IO iowait", "util": "IO util"}
+    """将AI磁盘评估写回服务器，忽略不再纳入报告的瞬时资源指标。"""
+    metric_names = {"disk": "磁盘"}
     results = []
     for item in assessments:
         metric = str(item.get("metric", item.get("id")) or "")
@@ -506,11 +524,11 @@ def evaluate_groups(
     batch_size: int = 15,
     max_batch_chars: int = 55000,
 ) -> str:
-    """按服务器集中完成日志语义去重和资源指标AI评估。
+    """按服务器集中完成日志语义去重和磁盘指标AI评估。
 
     Args:
         groups: 全部服务器的基础去重日志组。
-        servers: 服务器时间序列，用于携带资源指标。
+        servers: 服务器时间序列，用于携带磁盘指标。
         mode: auto自动降级、required失败终止、off关闭AI。
         api_key: 可选的显式DeepSeek API密钥，主要供受控调用或测试使用。
         batch_size: 单次请求最大日志组数量，默认15组以降低长JSON损坏概率。
@@ -533,6 +551,7 @@ def evaluate_groups(
     request_count = 0
     cache_hit_count = 0
     cache_miss_without_key = 0
+    invalid_key_detected = False
     # 按服务器分别分批：服务器名每批只发送一次，也确保AI语义去重不会跨服务器。
     pending_by_server: Dict[str, List[LogGroup]] = {}
     for group in pending:
@@ -549,7 +568,7 @@ def evaluate_groups(
 
     def process_batch(batch: List[LogGroup], metric_server: Optional[ServerSeries], server_name: str) -> None:
         """优先复用本地缓存，否则执行AI批次并在JSON损坏时递归拆批。"""
-        nonlocal request_count, cache_hit_count, cache_miss_without_key
+        nonlocal request_count, cache_hit_count, cache_miss_without_key, invalid_key_detected
         parsed = _load_cached_response(batch, metric_server)
         if parsed is not None:
             cache_hit_count += 1
@@ -558,6 +577,13 @@ def evaluate_groups(
                 server_name, len(batch), metric_server is not None,
             )
         else:
+            if invalid_key_detected:
+                cache_miss_without_key += 1
+                logger.warning(
+                    "DeepSeek API Key已判定无效，本批跳过API请求：服务器={}，日志组={}，保留规则预分类",
+                    server_name, len(batch),
+                )
+                return
             if not key:
                 cache_miss_without_key += 1
                 message = "本批未命中缓存，且未配置DeepSeek API密钥"
@@ -568,6 +594,12 @@ def evaluate_groups(
             request_count += 1
             try:
                 parsed = _request_batch(batch, key, request_count, metric_server)
+            except InvalidDeepSeekKeyError as exc:
+                # 首次鉴权失败后熔断本次任务，避免其余批次继续产生无效请求。
+                invalid_key_detected = True
+                cache_miss_without_key += 1
+                logger.error("{}；已停止本次报告后续DeepSeek请求，未命中缓存项使用规则预分类", exc)
+                return
             except (json.JSONDecodeError, KeyError, TypeError, ValueError):
                 # 本地自动修复仍无法解析时直接拆分，不再原样重发整批，减少无效请求。
                 if len(batch) <= 1:
@@ -595,16 +627,19 @@ def evaluate_groups(
             logger.warning("DeepSeek响应缺少 {} 个日志组的评估，缺失项保留规则结果", missing_count)
         if metric_server is not None:
             _apply_resource(metric_server, parsed.get("metric_assessments", []))
-            logger.info("服务器={}，资源指标AI评估返回 {} 项", server_name, len(metric_server.resource_assessments))
+            logger.info("服务器={}，磁盘指标AI评估返回 {} 项", server_name, len(metric_server.resource_assessments))
 
     for index, (batch, metric_server, server_name) in enumerate(initial_batches, start=1):
         logger.info("处理AI初始批次 {}/{}", index, len(initial_batches))
         process_batch(batch, metric_server, server_name)
     _merge_ai_duplicates(groups)
     logger.info(
-        "AI处理完成：语义去重后剩余 {} 个日志组，实际API请求={}，本地缓存命中批次={}，无密钥未命中批次={}",
+        "AI处理完成：语义去重后剩余 {} 个日志组，实际API请求={}，本地缓存命中批次={}，无可用Key未命中批次={}",
         len(groups), request_count, cache_hit_count, cache_miss_without_key,
     )
+    if invalid_key_detected:
+        # 鉴权错误只写执行日志，PDF评估状态不暴露Key配置或失败原因。
+        return "规则预分类"
     if cache_miss_without_key:
         return (
             "部分复用DeepSeek V4-Flash本地评估，未命中项使用规则预分类"

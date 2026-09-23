@@ -1,3 +1,4 @@
 reportlab==3.6.13; python_version < "3.8"
 reportlab>=4.0; python_version >= "3.8"
 loguru>=0.6.0
+PyMySQL>=1.0.0

@@ -2,7 +2,7 @@
 
 任务：
 1. 对日志合并语义相同项、分类、定级，并给出判断、建议和操作分析。
-2. 若输入含metrics，分别评估cpu、memory、disk、iowait、util的趋势、峰值和最新值，并给出判断、建议和操作分析。disk序列的第三项可能是“挂载点到使用率”的映射；必须逐个挂载点判断，reason中明确指出达到最高值或需要关注的挂载点。
+2. 若输入含metrics，只评估disk的趋势、峰值和最新值，并给出判断、建议和操作分析。CPU、内存和IO瞬时值不参与评估。disk序列的第三项可能是“挂载点到使用率”的映射；必须逐个挂载点判断，reason中明确指出达到最高值或需要关注的挂载点。
 
 定级规则：critical仅用于服务中断、OOM、磁盘写满、崩溃循环、数据损坏或安全事故；high为高概率影响服务；medium为需要处理但没有即时中断；low为低影响；info为线索。不得仅按出现次数定级。
 
@@ -18,10 +18,10 @@
 - 不知道目录所属业务时统一写成“相关应用日志目录”“相关配置目录”“相关数据目录”，不得猜测真实路径。占位符表示执行人员根据实际配置确认后替换，不代表可以直接复制执行。
 - 不得直接给出rm -rf、格式化磁盘、清空日志、强制终止关键进程等破坏性命令。涉及重启服务、删除文件、修改配置或释放磁盘空间时，必须写成“核验后经人工确认再执行”的条件步骤，并同时给出备份或回滚检查命令。
 - Linux命令不要使用Markdown代码块，不要换行；命令中的双引号必须按JSON规则转义，能使用单引号时优先使用单引号，以减少无效JSON。
-- category只能是application、docker、system_process；severity只能是critical、high、medium、low、info；资源metric必须沿用cpu、memory、disk、iowait、util。
+- category只能是application、docker、system_process；severity只能是critical、high、medium、low、info；资源metric只能是disk。
 - 只返回严格JSON，不得返回Markdown，不得遗漏任何输入id。属性名必须完整，不得使用单字母缩写。
 
 JSON结构：
-{"log_assessments":[{"id":"","duplicate_of":null,"category":"application","severity":"medium","immediate":false,"needs_fix":true,"title":"","reason":"","recommendation":"","action_analysis":""}],"metric_assessments":[{"metric":"cpu","severity":"low","immediate":false,"needs_fix":false,"title":"","reason":"","recommendation":"","action_analysis":""}]}
+{"log_assessments":[{"id":"","duplicate_of":null,"category":"application","severity":"medium","immediate":false,"needs_fix":true,"title":"","reason":"","recommendation":"","action_analysis":""}],"metric_assessments":[{"metric":"disk","severity":"low","immediate":false,"needs_fix":false,"title":"","reason":"","recommendation":"","action_analysis":""}]}
 
 没有日志或没有指标时，对应数组返回空数组。

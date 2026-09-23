@@ -36,6 +36,8 @@ IGNORED_DISK_FS_TYPES = {
 }
 # EFI 启动分区容量固定且不承载业务数据，不纳入服务器磁盘健康监测。
 IGNORED_DISK_MOUNT_POINTS = {"/boot/efi"}
+# 飞马2的应用日志目录来自共享NFS，会包含其他服务器写入的日志；PDF层不解析其应用日志正文。
+APPLICATION_LOG_EXCLUDED_SERVER_PREFIXES = ("飞马2-Interface邮件",)
 
 
 def read_text(path: Path) -> str:
@@ -320,6 +322,10 @@ def _apply_server_role_policy(snapshot: Snapshot) -> None:
         detail for detail in snapshot.docker_details
         if not any(name in detail for name in optional_containers)
     ]
+    # 飞马2扫描的是共享NFS应用日志，移除异常日志汇总项，避免共享文件影响该服务器状态。
+    snapshot.summary_rows = [
+        row for row in snapshot.summary_rows if row.item != "当天WARN/ERROR日志"
+    ]
 
     for row in snapshot.summary_rows:
         if row.item == "应用端口":
@@ -343,7 +349,7 @@ def classify_log(section: str, line: str) -> str:
     joined = f"{section} {line}".lower()
     if "docker" in joined or "dockerd" in joined or "containerd" in joined or "容器" in joined:
         return "Docker日志"
-    if "应用日志" in section or "日志目录" in section or re.search(r"(?:\.log|\.out)(?:\s|:|$)", line, re.I):
+    if "应用日志" in section or "日志目录" in section or re.search(r"(?:\.log|\.out)(?:\s|:|$)", joined, re.I):
         return "应用日志目录日志"
     return "系统/进程日志"
 
@@ -453,6 +459,7 @@ def parse_snapshot(
     front_lines: List[str] = []
     raw_logs: List[RawLog] = []
     section = "报告前言"
+    log_source = ""
     in_front = False
     in_raw = False
     overall = "未识别"
@@ -471,8 +478,12 @@ def parse_snapshot(
         match = SECTION_RE.match(line)
         if match:
             section = match.group(1)
+            log_source = ""
             current_process_name = None
             continue
+        if line.startswith("######## 当天异常关键字记录："):
+            # 保存具体日志文件来源，使共享目录日志能在进入AI前被准确识别为应用日志。
+            log_source = line.split("：", 1)[1].strip().rstrip("#").strip()
         process_section = CLIENT_PROCESS_SECTION_RE.match(line)
         if process_section:
             current_process_name = process_section.group(1)
@@ -496,7 +507,8 @@ def parse_snapshot(
             front_lines.append(line)
         # PDF解析层再次限制业务日期，避免Shell兼容问题把历史日志送入DeepSeek。
         if parse_logs and in_raw and is_log_line(line) and (report_date is None or _log_matches_report_date(line, report_date)):
-            raw_candidates.append((section, _log_sample_with_continuation(source_lines, line_index)))
+            source_context = f"{section} 日志文件={log_source}" if log_source else section
+            raw_candidates.append((source_context, _log_sample_with_continuation(source_lines, line_index)))
 
     captured_text = basic.get("巡检开始时间") or basic.get("生成时间") or path.stem
     captured_at = parse_datetime(captured_text) or parse_datetime(path.stem) or datetime.fromtimestamp(path.stat().st_mtime)
@@ -640,9 +652,14 @@ def parse_snapshot(
             worst = min(meaningful, key=lambda value: priority[value])
             snapshot.overall_status = "部分不可判定" if worst == "不可判定" else worst
 
+    exclude_application_logs = snapshot.remark.startswith(APPLICATION_LOG_EXCLUDED_SERVER_PREFIXES)
     for log_section, text in raw_candidates:
+        category = classify_log(log_section, text)
+        # 共享NFS中的应用日志无法证明由飞马2产生，不进入去重、AI、PDF明细或知识图谱。
+        if exclude_application_logs and category == "应用日志目录日志":
+            continue
         snapshot.raw_logs.append(RawLog(
-            category=classify_log(log_section, text),
+            category=category,
             section=log_section,
             text=text,
             snapshot_time=captured_at,

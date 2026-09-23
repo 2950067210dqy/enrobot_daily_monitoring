@@ -54,6 +54,34 @@ SEVERITY_COLORS = {
     "unassessed": colors.HexColor("#455A64"),
 }
 CATEGORY_ORDER = ("应用日志目录日志", "Docker日志", "系统/进程日志")
+# 一小时一次的CPU、内存和IO瞬时值不纳入PDF展示与状态判断；磁盘及inode仍保留。
+PDF_HIDDEN_RESOURCE_ITEMS = {"CPU", "CPU与负载", "内存", "Swap", "磁盘IO性能"}
+
+
+def _is_hidden_pdf_resource(item: str) -> bool:
+    """判断巡检项是否属于PDF不再展示的瞬时资源指标。"""
+    return any(item == name or item.startswith(name + "（") for name in PDF_HIDDEN_RESOURCE_ITEMS)
+
+
+def _pdf_status(snapshot: Snapshot) -> str:
+    """仅根据PDF保留的检查项计算服务器状态，避免瞬时CPU、内存或IO影响总览。"""
+    priority = {"异常": 0, "警告": 1, "不可判定": 2, "正常": 3, "信息": 4}
+    statuses = [
+        row.status for row in snapshot.summary_rows
+        if not _is_hidden_pdf_resource(row.item) and row.status in priority
+    ]
+    if not statuses:
+        return "未识别"
+    worst = min(statuses, key=lambda value: priority[value])
+    return "部分不可判定" if worst == "不可判定" else worst
+
+
+def _pdf_coverage(snapshot: Snapshot) -> tuple[str, List[str], List[str]]:
+    """过滤瞬时资源采集限制，返回PDF关注范围内的覆盖状态。"""
+    limited = [item for item in snapshot.limited_items if not _is_hidden_pdf_resource(item)]
+    excluded = [item for item in snapshot.excluded_items if not _is_hidden_pdf_resource(item)]
+    state = "部分受限" if limited else "按巡检范围完成" if excluded else "完整"
+    return state, limited, excluded
 
 
 def _clean(value: object) -> str:
@@ -166,7 +194,7 @@ def _disk_card_cell(snapshot: Snapshot, styles: Dict[str, ParagraphStyle], write
         for item in mounts:
             content.append(_p(f"{item.mount_point}：{item.percent:.1f}%", styles["center"]))
             # 每个挂载点单独输出进度条PNG，颜色也按该挂载点自身阈值判断。
-            bar = _metric_bar(item.percent, width=33 * mm)
+            bar = _metric_bar(item.percent, width=108 * mm)
             content.append(_chart_image(
                 writer,
                 bar,
@@ -175,7 +203,7 @@ def _disk_card_cell(snapshot: Snapshot, styles: Dict[str, ParagraphStyle], write
     else:
         value_text = "未采集" if snapshot.disk_percent is None else f"挂载点未识别：{snapshot.disk_percent:.1f}%"
         content.append(_p(value_text, styles["center"]))
-        bar = _metric_bar(snapshot.disk_percent, width=33 * mm)
+        bar = _metric_bar(snapshot.disk_percent, width=108 * mm)
         content.append(_chart_image(writer, bar, f"{snapshot.remark}_最新磁盘挂载点未识别_使用率"))
     return content
 
@@ -183,8 +211,8 @@ def _disk_card_cell(snapshot: Snapshot, styles: Dict[str, ParagraphStyle], write
 def _server_card(server: ServerSeries, styles: Dict[str, ParagraphStyle], writer: ChartImageWriter) -> Table:
     """生成首页中单台服务器的最新状态概要卡片。"""
     latest = server.latest
-    counts = latest.counters
-    top = Table([[ _p(latest.remark, styles["card_title"]), _status_paragraph(latest.overall_status, styles), _p(f"{len(server.snapshots)} 次采样", styles["center"]) ]], colWidths=[102 * mm, 30 * mm, 35 * mm])
+    coverage_state, limited_items, excluded_items = _pdf_coverage(latest)
+    top = Table([[ _p(latest.remark, styles["card_title"]), _status_paragraph(_pdf_status(latest), styles), _p(f"{len(server.snapshots)} 次采样", styles["center"]) ]], colWidths=[102 * mm, 30 * mm, 35 * mm])
     top.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#EAF2F8")),
         ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#A9C4D8")),
@@ -194,17 +222,11 @@ def _server_card(server: ServerSeries, styles: Dict[str, ParagraphStyle], writer
         ("TOPPADDING", (0, 0), (-1, -1), 5),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
     ]))
-    cells = [
-        _card_metric_cell(latest.remark, "CPU", latest.cpu_percent, styles, writer),
-        _card_metric_cell(latest.remark, "内存", latest.memory_percent, styles, writer),
-        _disk_card_cell(latest, styles, writer),
-        _card_metric_cell(latest.remark, "IO iowait", latest.io_iowait_percent, styles, writer),
-        _card_metric_cell(latest.remark, "IO %util", latest.io_util_percent, styles, writer),
-    ]
-    coverage = _p(f"采集：{latest.collection_state}\n受限 {len(latest.limited_items)} 项 / 未纳入 {len(latest.excluded_items)} 项", styles["center"])
+    disk_cell = _disk_card_cell(latest, styles, writer)
+    coverage = _p(f"采集：{coverage_state}\n受限 {len(limited_items)} 项 / 未纳入 {len(excluded_items)} 项", styles["center"])
     body = Table(
-        [[cells[0], cells[1], cells[2], cells[3], cells[4], coverage]],
-        colWidths=[24 * mm, 24 * mm, 37 * mm, 24 * mm, 24 * mm, 34 * mm],
+        [[disk_cell, coverage]],
+        colWidths=[127 * mm, 40 * mm],
     )
     body.setStyle(TableStyle([
         ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#C4D6E3")),
@@ -237,7 +259,7 @@ def _overview_label(server: ServerSeries) -> str:
 
 
 def _overview_charts(servers: Sequence[ServerSeries], writer: ChartImageWriter) -> List[object]:
-    """生成以时间为横轴、服务器为图例的全局资源趋势图。"""
+    """生成以时间为横轴、服务器为图例的全局磁盘趋势图。"""
     sample_count = max((len(server.snapshots) for server in servers), default=0)
     reference = max(servers, key=lambda server: len(server.snapshots)) if servers else None
     reference_dates = {
@@ -261,15 +283,7 @@ def _overview_charts(servers: Sequence[ServerSeries], writer: ChartImageWriter) 
             for server in servers
         }
 
-    cpu = metric_series("cpu_percent")
-    memory = metric_series("memory_percent")
-    iowait = metric_series("io_iowait_percent")
-    util = metric_series("io_util_percent")
-    charts: List[object] = [
-        _chart_image(writer, trend_chart("最新 CPU 使用率", labels, cpu, width=172 * mm, height=42 * mm, percent=True), "总览_最新CPU使用率"),
-        Spacer(1, 2 * mm),
-        _chart_image(writer, trend_chart("最新内存使用率", labels, memory, width=172 * mm, height=42 * mm, percent=True), "总览_最新内存使用率"),
-    ]
+    charts: List[object] = []
     mount_points = sorted(
         {mount for server in servers for snapshot in server.snapshots for mount in snapshot.disk_mounts},
         key=_disk_mount_sort_key,
@@ -301,24 +315,19 @@ def _overview_charts(servers: Sequence[ServerSeries], writer: ChartImageWriter) 
                 "总览_最新磁盘使用率_挂载点未识别",
             ),
         ])
-    charts.extend([
-        Spacer(1, 2 * mm),
-        _chart_image(writer, trend_chart("最新磁盘 IO iowait", labels, iowait, width=172 * mm, height=42 * mm, percent=True), "总览_最新磁盘IO_iowait"),
-        Spacer(1, 2 * mm),
-        _chart_image(writer, trend_chart("最新磁盘 IO %util", labels, util, width=172 * mm, height=42 * mm, percent=True), "总览_最新磁盘IO_util"),
-    ])
     return charts
 
 
 def _coverage_table(snapshot: Snapshot, styles: Dict[str, ParagraphStyle]) -> Table:
     """展示巡检采集完整度、权限受限和脚本未纳入项目。"""
+    coverage_state, limited_items, excluded_items = _pdf_coverage(snapshot)
     rows = [
         [_p("巡检模式", styles["header"]), _p("采集状态", styles["header"]), _p("采集受限", styles["header"]), _p("脚本未纳入", styles["header"])],
         [
             _p(snapshot.profile, styles["center"]),
-            _p(snapshot.collection_state, styles["center"]),
-            _p("、".join(snapshot.limited_items) or "无", styles["table"]),
-            _p("、".join(snapshot.excluded_items) or "无", styles["table"]),
+            _p(coverage_state, styles["center"]),
+            _p("、".join(limited_items) or "无", styles["table"]),
+            _p("、".join(excluded_items) or "无", styles["table"]),
         ],
     ]
     table = Table(rows, colWidths=[34 * mm, 32 * mm, 48 * mm, 65 * mm])
@@ -360,6 +369,8 @@ def _summary_rows(server: ServerSeries, styles: Dict[str, ParagraphStyle]) -> Lo
     snapshot = server.latest
     rows = [[_p("状态", styles["header"]), _p("检查项", styles["header"]), _p("结果概要", styles["header"])]]
     for row in snapshot.summary_rows:
+        if _is_hidden_pdf_resource(row.item):
+            continue
         abnormal_times = []
         for historical in server.snapshots:
             if any(item.item == row.item and item.status == "异常" for item in historical.summary_rows):
@@ -394,7 +405,7 @@ def _summary_rows(server: ServerSeries, styles: Dict[str, ParagraphStyle]) -> Lo
 def _server_charts(server: ServerSeries, styles: Dict[str, ParagraphStyle], writer: ChartImageWriter) -> List[object]:
     """生成单台服务器的进程线程和日志目录变化图。
 
-    CPU、内存、磁盘和IO已经在首页按全部服务器统一展示，此处不再重复绘制。
+    磁盘已经在首页按全部服务器统一展示，此处不再重复绘制。
     """
     labels = _labels(server)
     process_names = sorted({name for item in server.snapshots for name in item.processes})
@@ -451,21 +462,22 @@ def _assessment_summary(groups: Sequence[LogGroup], ai_status: str, styles: Dict
 
 
 def _resource_assessment_table(servers: Sequence[ServerSeries], styles: Dict[str, ParagraphStyle]) -> LongTable:
-    """生成资源指标的重要度、判断、建议、操作和来源表。"""
+    """生成磁盘指标的重要度、判断、建议、操作和来源表。"""
     rows = [[
         _p("服务器", styles["header"]), _p("指标", styles["header"]),
         _p("重要度", styles["header"]), _p("判断", styles["header"]),
         _p("建议", styles["header"]), _p("操作", styles["header"]), _p("来源", styles["header"]),
     ]]
     for server in servers:
-        if not server.resource_assessments:
+        disk_assessments = [item for item in server.resource_assessments if item.metric == "磁盘"]
+        if not disk_assessments:
             rows.append([
-                _p(server.latest.remark, styles["small"]), _p("资源指标", styles["table"]),
-                _p("未评估", styles["center"]), _p("未取得资源指标AI评估结果。", styles["small"]),
+                _p(server.latest.remark, styles["small"]), _p("磁盘", styles["table"]),
+                _p("未评估", styles["center"]), _p("未取得磁盘指标AI评估结果。", styles["small"]),
                 _p("-", styles["small"]), _p("-", styles["small"]), _p("未评估", styles["small"]),
             ])
             continue
-        for item in server.resource_assessments:
+        for item in disk_assessments:
             severity_style = ParagraphStyle(
                 "resource_severity_" + item.severity,
                 parent=styles["center"],
@@ -649,7 +661,7 @@ def create_pdf(servers: Sequence[ServerSeries], output: Path, ai_status: str, ma
     output.parent.mkdir(parents=True, exist_ok=True)
     chart_writer = ChartImageWriter(chart_directory_for_pdf(output))
     document = SimpleDocTemplate(str(output), pagesize=A4, leftMargin=15 * mm, rightMargin=15 * mm, topMargin=15 * mm, bottomMargin=16 * mm, title="服务器巡检汇总报告", author="服务器巡检工具")
-    story: List[object] = [_p("服务器巡检图表总览", styles["title"]), Spacer(1, 5 * mm)]
+    story: List[object] = [_p("服务器磁盘巡检总览", styles["title"]), Spacer(1, 5 * mm)]
     # 首页先给出每台服务器的可视化概要，避免无关文字占据首屏。
     for server in servers:
         story.extend([_server_card(server, styles, chart_writer), Spacer(1, 4 * mm)])
@@ -677,7 +689,7 @@ def create_pdf(servers: Sequence[ServerSeries], output: Path, ai_status: str, ma
     all_groups = sort_groups([group for server in servers for group in server.log_groups])
     story.extend([
         Spacer(1, 4 * mm), _p("异常评估汇总", styles["h1"]),
-        _p("资源指标 AI 评估", styles["h2"]),
+        _p("磁盘指标 AI 评估", styles["h2"]),
         _resource_assessment_table(servers, styles), Spacer(1, 4 * mm),
         _assessment_summary(all_groups, ai_status, styles), Spacer(1, 4 * mm),
         _p("各服务器日志汇总", styles["h2"]), _server_log_summary(all_groups, servers, styles),

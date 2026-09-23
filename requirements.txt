@@ -1,0 +1,6 @@
+# PDF generation and chart rendering.
+reportlab==3.6.13; python_version < "3.8"
+reportlab[renderpm]==4.4.3; python_version >= "3.8"
+PyMySQL==1.1.1
+# Structured runtime logging.
+loguru>=0.6.0

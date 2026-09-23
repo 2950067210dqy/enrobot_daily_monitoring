@@ -1,0 +1,5 @@
+# Local credentials and Python caches
+/secret.py
+/server_health_report/secret.py
+__pycache__/
+*.py[cod]

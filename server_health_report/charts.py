@@ -17,6 +17,18 @@ PALETTE = ["#1976D2", "#E65100", "#2E7D32", "#7B1FA2", "#C62828", "#00838F"]
 CHART_FONT_NAME = "ServerHealthChartChinese"
 
 
+def _available_renderpm_backend() -> Optional[str]:
+    """优先使用随ReportLab 3或renderpm extra提供的本地渲染后端。"""
+    try:
+        from reportlab.graphics import _renderPM  # noqa: F401
+    except ImportError:
+        return None
+    return "_renderPM"
+
+
+RENDER_PM_BACKEND = _available_renderpm_backend()
+
+
 def register_chart_font() -> str:
     """注册同时支持PNG栅格化和中文显示的图表字体。
 
@@ -107,7 +119,22 @@ class ChartImageWriter:
         register_chart_font()
         sequence = len(self.paths) + 1
         path = self.directory / f"chart_{sequence:03d}_{_safe_chart_name(label)}.png"
-        renderPM.drawToFile(drawing, str(path), fmt="PNG", dpi=self.dpi, bg=colors.white)
+        render_options = {
+            "fmt": "PNG",
+            "dpi": self.dpi,
+            "bg": colors.white,
+        }
+        if RENDER_PM_BACKEND:
+            render_options["backend"] = RENDER_PM_BACKEND
+        try:
+            renderPM.drawToFile(drawing, str(path), **render_options)
+        except Exception as exc:
+            if "renderPM backend" in str(exc) or "rlPyCairo" in str(exc):
+                raise RuntimeError(
+                    "ReportLab图表渲染后端不可用。请双击项目根目录的"
+                    "repair_reportlab.cmd修复依赖。"
+                ) from exc
+            raise
         self.paths.append(path)
         return path
 
